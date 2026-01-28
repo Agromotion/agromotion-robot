@@ -2,86 +2,89 @@ import asyncio
 import json
 import cv2
 import logging
+import os
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiohttp_cors import setup, ResourceOptions
 from av import VideoFrame
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("pc")
+logger = logging.getLogger("agromotion-sim")
 
 class LocalVideoTrack(VideoStreamTrack):
-    """Lê um vídeo local e transforma em frames WebRTC"""
     def __init__(self, path):
         super().__init__()
-        print(f"[DEBUG] A abrir ficheiro de vídeo: {path}")
         self.cap = cv2.VideoCapture(path)
-        if not self.cap.isOpened():
-            print(f"[ERRO] Não foi possível abrir o vídeo em: {path}")
+        self.target_width = None 
+        self.target_height = None
+        
+    def set_quality(self, height):
+        if height in ["original", "auto"]:
+            self.target_width = None
+            self.target_height = None
+            logger.info("[QUALITY] Reset para resolução original")
+        else:
+            try:
+                self.target_height = int(height)
+                self.target_width = int((self.target_height * 16) / 9)
+                logger.info(f"[QUALITY] Redimensionando para: {self.target_width}x{self.target_height}")
+            except:
+                pass
 
     async def recv(self):
         pts, time_base = await self.next_timestamp()
         ret, frame = self.cap.read()
-        
         if not ret:
-            print("[DEBUG] Fim do vídeo atingido. A reiniciar loop...")
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ret, frame = self.cap.read()
         
-        # Converter frame do OpenCV para PyAV
+        if self.target_height and self.target_width:
+            frame = cv2.resize(frame, (self.target_width, self.target_height), interpolation=cv2.INTER_AREA)
+
         new_frame = VideoFrame.from_ndarray(frame, format="bgr24")
         new_frame.pts = pts
         new_frame.time_base = time_base
         return new_frame
 
 async def offer(request):
-    print(f"\n[DEBUG] Recebido pedido de conexão de: {request.remote}")
     params = await request.json()
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
-
     pc = RTCPeerConnection()
-    print("[DEBUG] PeerConnection criada.")
-
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        print(f"[DEBUG] Estado da Conexão: {pc.connectionState}")
-        if pc.connectionState == "failed" or pc.connectionState == "closed":
-            await pc.close()
-
-    video_path = r"PATH DO VÍDEO A MOSTRAR"  # Substitua pelo caminho do seu vídeo local
-    video_track = LocalVideoTrack(video_path)
-    pc.addTrack(video_track)
-    print("[DEBUG] Track de vídeo local adicionada.")
-
-    await pc.setRemoteDescription(offer)
-    print("[DEBUG] Remote Description configurada.")
     
+    video_path = r"C:\Users\user\Videos\video_teste2.MP4"
+    video_track = LocalVideoTrack(video_path)
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        @channel.on("message")
+        def on_message(message):
+            if isinstance(message, str):
+                data = json.loads(message)
+                if data.get("type") == "SET_QUALITY":
+                    video_track.set_quality(data.get("value"))
+
+    # 1. Aplicamos a oferta primeiro
+    await pc.setRemoteDescription(offer)
+
+    # 2. Em vez de pc.addTrack, vamos associar a track ao transceiver existente
+    for transceiver in pc.getTransceivers():
+        if transceiver.kind == "video":
+            pc.addTrack(video_track) 
+            # O aiortc associa automaticamente ao transceiver correto aqui
+
+    # 3. Criamos a resposta
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    print("[DEBUG] Answer criada e Local Description definida.")
 
     return web.Response(
         content_type="application/json",
-        text=json.dumps({
-            "sdp": pc.localDescription.sdp, 
-            "type": pc.localDescription.type
-        }),
+        text=json.dumps({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}),
     )
 
 app = web.Application()
-
-cors = setup(app, defaults={
-    "*": ResourceOptions(
-        allow_credentials=True,
-        expose_headers="*",
-        allow_headers="*",
-    )
-})
-
+cors = setup(app, defaults={"*": ResourceOptions(allow_credentials=True, expose_headers="*", allow_headers="*")})
 resource = app.router.add_post("/offer", offer)
 cors.add(resource)
 
 if __name__ == "__main__":
-    print("--- Servidor de Simulação Agromotion Ativo ---")
-    print("Porta: 8080 | Endpoint: /offer")
     web.run_app(app, host="0.0.0.0", port=8080)
