@@ -1,0 +1,4 @@
+camera/production/.env
+camera/production/secrets.json
+camera/simulator/secrets.json
+camera/simulator/.env
