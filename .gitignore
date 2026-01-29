@@ -2,3 +2,5 @@ camera/production/.env
 camera/production/secrets.json
 camera/simulator/secrets.json
 camera/simulator/.env
+camera/simulator LiveKit/secrets.json
+camera/simulator LiveKit/.env
