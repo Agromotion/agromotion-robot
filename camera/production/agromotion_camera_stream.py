@@ -13,6 +13,13 @@ from firebase_admin import credentials, firestore
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from av import VideoFrame
 
+# Importação da Picamera2 (Nativa para a imx708)
+try:
+    from pypicamera2 import Picamera2
+except ImportError:
+    # Fallback para ambientes de desenvolvimento sem câmara
+    Picamera2 = None
+
 # Configuração de Logs
 logging.basicConfig(
     level=logging.INFO,
@@ -24,39 +31,39 @@ logger = logging.getLogger("agromotion-pi")
 load_dotenv()
 
 class CameraStreamTrack(VideoStreamTrack):
-    def __init__(self, cap):
+    def __init__(self, picam):
         super().__init__()
-        self.cap = cap
+        self.picam = picam
         self.target_width = 1280
         self.target_height = 720
         self.frame_count = 0
         self.last_fps_check = time.time()
         self.current_fps = 0
-        
-        # Configuração inicial de hardware
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
 
     def set_quality(self, height):
         if height in ["original", "auto"]:
-            self.target_width, self.target_height = 1280, 720
+            h, w = 720, 1280
         else:
-            self.target_height = int(height)
-            self.target_width = int((self.target_height * 16) / 9)
-        logger.info(f"[QUALIDADE] Ajustada para: {self.target_width}x{self.target_height}")
+            h = int(height)
+            w = int((h * 16) / 9)
+        
+        self.target_width, self.target_height = w, h
+        logger.info(f"[QUALIDADE] Pedido de ajuste para: {w}x{h} (Via Software)")
 
     async def recv(self):
         pts, time_base = await self.next_timestamp()
-        ret, frame = self.cap.read()
         
-        if not ret:
-            # Frame de erro se a câmara falhar em runtime
-            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            cv2.putText(frame, "ERRO DE CAPTURA", (450, 360), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        else:
+        # Captura frame da Picamera2
+        frame = self.picam.capture_array()
+        
+        # Converte de RGB (padrão Picamera2) para BGR (padrão OpenCV/Script)
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        # Redimensionamento se necessário
+        if frame.shape[0] != self.target_height:
             frame = cv2.resize(frame, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
 
+        # Cálculo de FPS
         self.frame_count += 1
         now = time.time()
         if now - self.last_fps_check >= 1.0:
@@ -73,13 +80,12 @@ class AgromotionRobot:
     def __init__(self):
         self.robot_id = os.getenv("ROBOT_ID")
         self.cert_path = os.getenv("FIREBASE_CERT_PATH")
-        self.cap = None
+        self.picam = None
         self.pc = None
         self.data_channel = None
         self.db = None
         self.doc_ref = None
 
-    # --- Diagnósticos ---
     def check_internet(self):
         try:
             socket.create_connection(("8.8.8.8", 53), timeout=3)
@@ -87,15 +93,23 @@ class AgromotionRobot:
         except: return False
 
     def check_camera(self):
-        backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_V4L2
-        cap = cv2.VideoCapture(0, backend)
-        if cap.isOpened():
-            ret, _ = cap.read()
-            if ret:
-                self.cap = cap # Mantemos a câmara aberta para a track
+        try:
+            if self.picam:
                 return True
-        if cap: cap.release()
-        return False
+            
+            # Inicializa Picamera2
+            self.picam = Picamera2()
+            # Configura a resolução de captura diretamente no sensor (ganha performance)
+            self.picam.configure(self.picam.create_preview_configuration(main={"format": 'RGB888', "size": (1280, 720)}))
+            self.picam.start()
+            logger.info("📸 Picamera2 (imx708) iniciada com sucesso.")
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao aceder à câmara: {e}")
+            if self.picam: 
+                self.picam.stop()
+                self.picam = None
+            return False
 
     async def send_telemetry(self, track):
         try:
@@ -123,7 +137,7 @@ class AgromotionRobot:
             if self.pc: await self.pc.close()
             
             self.pc = RTCPeerConnection()
-            track = CameraStreamTrack(self.cap)
+            track = CameraStreamTrack(self.picam)
 
             @self.pc.on("datachannel")
             def on_datachannel(channel):
@@ -148,25 +162,24 @@ class AgromotionRobot:
             answer = await self.pc.createAnswer()
             await self.pc.setLocalDescription(answer)
             self.doc_ref.update({"answer": {"sdp": self.pc.localDescription.sdp, "type": self.pc.localDescription.type}})
-            logger.info("🚀 Conexão estabelecida com sucesso!")
+            logger.info("🚀 WebRTC conectado!")
         except Exception as e:
             logger.error(f"Erro no WebRTC: {e}")
 
     async def run(self):
         while True:
-            print("\n" + "="*40 + "\n🔍 DIAGNÓSTICO DE ARRANQUE\n" + "="*40)
+            print("\n" + "="*40 + "\n🔍 DIAGNÓSTICO AGROMOTION\n" + "="*40)
             
             net = self.check_internet()
             print(f"[{'✅' if net else '❌'}] Internet")
             
             cam = self.check_camera()
-            print(f"[{'✅' if cam else '❌'}] Câmara")
+            print(f"[{'✅' if cam else '❌'}] Câmara (imx708)")
             
-            env = all([self.robot_id, self.cert_path]) and os.path.exists(self.cert_path or "")
-            print(f"[{'✅' if env else '❌'}] Configuração (.env)\n" + "="*40)
+            env_exists = all([self.robot_id, self.cert_path]) and os.path.exists(self.cert_path or "")
+            print(f"[{'✅' if env_exists else '❌'}] Configuração (.env)\n" + "="*40)
 
-            if net and cam and env:
-                logger.info("✅ Tudo pronto. Entrando em modo de escuta...")
+            if net and cam and env_exists:
                 try:
                     if not firebase_admin._apps:
                         cred = credentials.Certificate(self.cert_path)
@@ -185,22 +198,22 @@ class AgromotionRobot:
                     
                     self.doc_ref.on_snapshot(on_snap)
                     
-                    while self.check_internet(): # Mantém vivo enquanto houver net
+                    while self.check_internet():
                         await asyncio.sleep(5)
                     
-                    logger.warning("🌐 Internet perdida. Reiniciando ciclo de diagnóstico...")
+                    logger.warning("🌐 Internet perdida. Reiniciando...")
                 except Exception as e:
-                    logger.error(f"Falha na lógica principal: {e}")
+                    logger.error(f"Falha na lógica: {e}")
             else:
-                logger.error("❌ Falha no Check-up. Tentando novamente em 30s...")
+                logger.error("❌ Falha no Check-up. Tentando novamente em 15s...")
             
-            if self.cap: self.cap.release()
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
 
 if __name__ == "__main__":
     robot = AgromotionRobot()
     try:
         asyncio.run(robot.run())
     except KeyboardInterrupt:
-        if robot.cap: robot.cap.release()
+        if robot.picam: 
+            robot.picam.stop()
         logger.info("🛑 Sistema encerrado.")
