@@ -99,6 +99,7 @@ class AgromotionRobot:
             
             # Inicializa Picamera2
             self.picam = Picamera2()
+            self.picam.set_controls({"AfMode": 1})
             # Configura a resolução de captura diretamente no sensor (ganha performance)
             self.picam.configure(self.picam.create_preview_configuration(main={"format": 'RGB888', "size": (1280, 720)}))
             self.picam.start()
