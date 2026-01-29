@@ -36,13 +36,13 @@ Com o ambiente virtual ativo, instala os requisitos necessários:
 
 ## 5 - Configuração de Credenciais
 ### 5.1  - Firebase
-Coloca o teu ficheiro de chave privada (`serviceAccountKey.json`) numa pasta chamada `secrets/`.
+Coloca o teu ficheiro de chave privada (`secrets.json`) numa pasta chamada `secrets/`.
 
 ### 5.2 - Variáveis de Ambiente
 Cria um ficheiro `.env` na raiz do projeto:
 
     ROBOT_ID=robot_01
-    FIREBASE_CERT_PATH=secrets/serviceAccountKey.json
+    FIREBASE_CERT_PATH=secrets/secrets.json
 
 ## 6 - Como Executar
 Executa o script principal que utiliza a câmara física do Pi:
