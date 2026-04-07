@@ -1,0 +1,25 @@
+# Mediamtx Configuration for AgroMotion Robot
+# Simplified config compatible with latest mediamtx versions
+
+# Logging
+logLevel: info
+
+# RTSP Server (input from FFmpeg/libcamera)
+rtsp: yes
+rtspAddress: "0.0.0.0:8554"
+
+# WebRTC Server (output to browsers)
+webrtc: yes
+webrtcAddress: "0.0.0.0:8555"
+
+# Disable unused protocols
+rtmp: no
+hls: no
+srt: no
+
+# Path configuration
+paths:
+  robot:
+    # Accept RTSP input and serve via WebRTC
+    sourceProtocol: tcp
+
