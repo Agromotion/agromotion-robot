@@ -1,5 +1,6 @@
 import logging
 import time
+import re
 from firebase_admin import firestore, messaging
 
 logger = logging.getLogger(__name__)
@@ -8,12 +9,12 @@ class NotificationService:
     def __init__(self, db, robot_id):
         self.db = db
         self.robot_id = robot_id
-        # Topic name for FCM subscriptions (e.g., robot_agromotion_robot_01)
-        self.topic_name = f"robot_{self.robot_id.replace('-', '_')}"
-        self._cooldowns = {} # Stores {event_title: last_sent_time}
+        clean_id = re.sub(r'[^a-zA-Z0-9-_]', '_', self.robot_id)
+        self.topic_name = f"robot_{clean_id}"
+        self._cooldowns = {}  # {event_title: last_sent_time}
 
     def _get_authorized_emails(self):
-        """Fetch emails from the authorized_emails collection."""
+        """Busca a lista de emails autorizados a receber alertas."""
         try:
             docs = self.db.collection('authorized_emails').stream()
             return [doc.id for doc in docs]
@@ -23,8 +24,8 @@ class NotificationService:
 
     def broadcast_alert(self, title, message, alert_type="info", cooldown_seconds=300):
         """
-        Sends notifications with a cooldown to prevent spamming.
-        alert_type: 'info', 'warning', 'error', 'success'
+        Envia notificações push e guarda no histórico dos utilizadores.
+        cooldown_seconds: evita spam de alertas repetidos (ex: GPS a saltar).
         """
         now = time.time()
         if title in self._cooldowns and (now - self._cooldowns[title]) < cooldown_seconds:
@@ -32,11 +33,17 @@ class NotificationService:
 
         self._cooldowns[title] = now
         emails = self._get_authorized_emails()
+        
+        if not emails:
+            logger.warning(f"Nenhum utilizador autorizado para enviar alerta: {title}")
+            return
 
-        # 1. Save to History for each user (so they can delete/dismiss individually)
+        # Guardar no Histórico de cada utilizador via Batch
         try:
+            batch = self.db.batch()
             for email in emails:
-                self.db.collection('users').document(email).collection('notifications').add({
+                notif_ref = self.db.collection('users').document(email).collection('notifications').document()
+                batch.set(notif_ref, {
                     'title': title,
                     'message': message,
                     'type': alert_type,
@@ -44,20 +51,42 @@ class NotificationService:
                     'timestamp': firestore.SERVER_TIMESTAMP,
                     'robotId': self.robot_id
                 })
+            batch.commit()
+            logger.debug(f"Histórico de notificações atualizado para {len(emails)} utilizadores.")
         except Exception as e:
-            logger.error(f"Erro ao salvar histórico: {e}")
+            logger.error(f"Erro ao salvar histórico no Firestore: {e}")
 
-        # 2. Send Real-time Push Notification via FCM
+        # Enviar Notificação Push em Tempo Real via FCM (Tópico)
         try:
+            # Configuração visual por tipo de alerta
+            emoji = "⚠️" if alert_type == "warning" else "🚨" if alert_type == "error" else "🤖"
+            
             msg = messaging.Message(
                 notification=messaging.Notification(
-                    title=f"🤖 {title}",
+                    title=f"{emoji} {title}",
                     body=message
                 ),
+                # Payload de dados para a lógica interna da App
+                data={
+                    "robotId": self.robot_id,
+                    "type": alert_type,
+                    "click_action": "FLUTTER_NOTIFICATION_CLICK"
+                },
                 topic=self.topic_name,
-                android=messaging.AndroidConfig(priority='high')
+                android=messaging.AndroidConfig(
+                    priority='high',
+                    notification=messaging.AndroidNotification(
+                        sound='default',
+                        click_action='FLUTTER_NOTIFICATION_CLICK'
+                    )
+                ),
+                apns=messaging.APNSConfig(
+                    payload=messaging.APNSPayload(
+                        aps=messaging.Aps(sound='default')
+                    )
+                )
             )
             messaging.send(msg)
-            logger.info(f"🔔 Notificação enviada: {title}")
+            logger.info(f"Notificação Push enviada para o tópico {self.topic_name}: {title}")
         except Exception as e:
             logger.error(f"Erro ao enviar FCM: {e}")

@@ -68,17 +68,16 @@ class SerialHandler:
             self.is_connected = False
             logger.info("✓ Disconnected from Arduino")
 
-    async def send_move_command(self, fl: int, fr: int, rear: int, duration_ms: int = 100) -> bool:
+    async def send_move_command(self, left: int, right: int, duration_ms: int = 100) -> bool:
         if not self.is_connected: return False
         command = {
-            "cmd": "MOVE",
-            "wheels": {
-                "FL": max(0, min(255, fl)), 
-                "FR": max(0, min(255, fr)), 
-                "REAR": max(0, min(255, rear))
-            },
-            "duration": max(10, min(5000, duration_ms))
-        }
+        "cmd": "MOVE",
+        "wheels": {
+            "L": max(-255, min(255, left)), 
+            "R": max(-255, min(255, right))
+        },
+        "duration": max(10, min(5000, duration_ms))
+    }
         return await self._send_command(command)
 
     async def send_stop_command(self) -> bool:
