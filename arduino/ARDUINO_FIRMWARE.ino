@@ -1,22 +1,22 @@
 #include <ArduinoJson.h>
 #include <TinyGPS++.h>
-#include <Arduino_LPS22HB.h> // Biblioteca para o sensor de pressão/temp do Nano 33 BLE
+#include <Arduino_LPS22HB.h> 
 
-// --- Configuração ---
-const float BATT_MAX = 14.0;         // 100%
-const float BATT_MIN = 10.0;         // 0%
-const float DIVISOR_RATIO = 5.0;     // Vin / Vout (calculado: 13.63/2.726)
-const float ADC_REF = 3.3;           // Voltagem de referência do Nano 33 Sense
-const float CURRENT_ZERO_V = 2.5;    // Centro do ACS712 (0A costuma ser 2.5V em sistemas 5V)
-const float CURRENT_SENS = 0.100;    // Sensibilidade (ex: 100mV/A para o modelo 20A)
+// --- Configurações de Hardware ---
+const float BATT_MAX = 14.0;
+const float BATT_MIN = 10.0;
+const float DIVISOR_RATIO = 5.0;
+const float ADC_REF = 3.3;
+const float CURRENT_ZERO_V = 2.5; 
+const float CURRENT_SENS = 0.100;
 
-// --- Estruturas de Hardware ---
 struct MotorPins {
-  int en, in1, in2;
+  int rpwm, lpwm, ren, len;
 };
-MotorPins mFL = {2, 3, 4};
-MotorPins mFR = {5, 6, 7};
-MotorPins mREAR = {9, 10, 11};
+
+// Pinos funcionais do segundo script (IBT-2 / BTS7960)
+MotorPins mLeft = {4, 5, 6, 7}; 
+MotorPins mRight = {8, 9, 10, 11};
 
 const int battery_voltage_pin = A0;
 const int current_sensor_pin = A1;
@@ -26,23 +26,19 @@ TinyGPSPlus gps;
 unsigned long command_timeout = 0;
 unsigned long last_gps_send = 0;
 unsigned long last_battery_send = 0;
-float smoothed_voltage = 13.0; // Valor inicial médio
+float smoothed_voltage = 13.0;
 
 void setup() {
-  // O Nano 33 BLE Sense Rev2 tem ADCs de alta resolução
-  analogReadResolution(12); 
-  
-  Serial.begin(115200);   // USB para Raspberry Pi
-  Serial1.begin(115200);  // Grove Air530 GPS
+  analogReadResolution(12); // Resolução nativa do Nano 33 BLE
+  Serial.begin(115200);   
+  Serial1.begin(115200);  
   BARO.begin();
   
-  pinMode(mFL.en, OUTPUT); pinMode(mFL.in1, OUTPUT); pinMode(mFL.in2, OUTPUT);
-  pinMode(mFR.en, OUTPUT); pinMode(mFR.in1, OUTPUT); pinMode(mFR.in2, OUTPUT);
-  pinMode(mREAR.en, OUTPUT); pinMode(mREAR.in1, OUTPUT); pinMode(mREAR.in2, OUTPUT);
+  setup_motor(mLeft);
+  setup_motor(mRight);
 
   stop_all_motors();
   
-  // Feedback visual de arranque
   StaticJsonDocument<100> doc;
   doc["type"] = "INIT";
   doc["status"] = "ready";
@@ -51,36 +47,59 @@ void setup() {
 }
 
 void loop() {
-  // 1. Processar Comandos do Pi
   if (Serial.available()) {
     process_serial_command();
   }
 
-  // 2. Ler GPS (Stream constante)
   while (Serial1.available()) {
     gps.encode(Serial1.read());
   }
 
-  // 3. Enviar Telemetria GPS (1s)
   if (millis() - last_gps_send > 1000) {
     send_gps_data();
     last_gps_send = millis();
   }
 
-  // 4. Enviar Telemetria da Bateria (5s)
   if (millis() - last_battery_send > 5000) {
     send_battery_data();
     last_battery_send = millis();
   }
 
-  // 5. Safety Timeout (Failsafe)
-  if (millis() > command_timeout && command_timeout != 0) {
+  if (command_timeout != 0 && millis() > command_timeout) {
     stop_all_motors();
     command_timeout = 0;
   }
 }
 
-// --- Processamento de Comandos do Pi ---
+// --- Lógica de Movimento ---
+void setup_motor(MotorPins m) {
+  pinMode(m.rpwm, OUTPUT);
+  pinMode(m.lpwm, OUTPUT);
+  pinMode(m.ren, OUTPUT);
+  pinMode(m.len, OUTPUT);
+  digitalWrite(m.ren, HIGH);
+  digitalWrite(m.len, HIGH);
+}
+
+void drive_motor(MotorPins m, int speed) {
+  int pwmValue = constrain(abs(speed), 0, 255);
+  if (speed > 0) { 
+    analogWrite(m.lpwm, pwmValue);
+    analogWrite(m.rpwm, 0);
+  } else if (speed < 0) { 
+    analogWrite(m.lpwm, 0);
+    analogWrite(m.rpwm, pwmValue);
+  } else { 
+    analogWrite(m.lpwm, 0);
+    analogWrite(m.rpwm, 0);
+  }
+}
+
+void stop_all_motors() {
+  drive_motor(mLeft, 0);
+  drive_motor(mRight, 0);
+}
+
 void process_serial_command() {
   StaticJsonDocument<256> doc;
   DeserializationError error = deserializeJson(doc, Serial);
@@ -88,13 +107,9 @@ void process_serial_command() {
 
   String cmd = doc["cmd"];
   if (cmd == "MOVE") {
-    // Comando vem do command_handler.py
-    // Aceita valores de -255 a 255 para suportar rotação/marcha-atrás
-    control_motor(mFL, doc["wheels"]["FL"]);
-    control_motor(mFR, doc["wheels"]["FR"]);
-    control_motor(mREAR, doc["wheels"]["REAR"]);
-    
-    uint16_t duration = doc["duration"] | 500;
+    drive_motor(mLeft, doc["wheels"]["L"]);
+    drive_motor(mRight, doc["wheels"]["R"]);
+    uint16_t duration = doc["duration"] | 1000;
     command_timeout = millis() + duration;
     send_ack("MOVE");
   } 
@@ -102,37 +117,11 @@ void process_serial_command() {
     stop_all_motors();
     send_ack("STOP");
   }
-  else if (cmd == "PING") {
-    send_ack("PONG");
-  }
 }
 
-// --- Controlo de Hardware real ---
-void control_motor(MotorPins m, int speed) {
-  if (speed > 0) { // Frente
-    digitalWrite(m.in1, HIGH);
-    digitalWrite(m.in2, LOW);
-    analogWrite(m.en, constrain(speed, 0, 255));
-  } else if (speed < 0) { // Trás
-    digitalWrite(m.in1, LOW);
-    digitalWrite(m.in2, HIGH);
-    analogWrite(m.en, constrain(abs(speed), 0, 255));
-  } else { // Parar
-    digitalWrite(m.in1, LOW);
-    digitalWrite(m.in2, LOW);
-    analogWrite(m.en, 0);
-  }
-}
-
-void stop_all_motors() {
-  control_motor(mFL, 0);
-  control_motor(mFR, 0);
-  control_motor(mREAR, 0);
-}
-
-// --- Envio de Telemetria ---
+// --- Telemetria Restaurada ---
 void send_gps_data() {
-  StaticJsonDocument<300> out;
+  StaticJsonDocument<400> out;
   out["type"] = "GPS";
   out["is_valid"] = gps.location.isValid();
   out["latitude"] = gps.location.lat();
@@ -141,7 +130,6 @@ void send_gps_data() {
   out["satellites"] = gps.satellites.value();
   out["hdop"] = gps.hdop.hdop();
   
-  // Formatando timestamp para ISO ou similar
   if (gps.time.isValid()) {
     char time_str[12];
     sprintf(time_str, "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
@@ -155,32 +143,22 @@ void send_gps_data() {
 }
 
 void send_battery_data() {
-  // Leitura de Voltagem
   int raw_v = analogRead(battery_voltage_pin);
   float instant_v = (raw_v / 4095.0) * ADC_REF * DIVISOR_RATIO;
-  
-  // Suavização (Filtro Passa-Baixo) para ignorar ruído dos motores
   smoothed_voltage = (smoothed_voltage * 0.9) + (instant_v * 0.1);
 
-  // Leitura de Corrente (ACS712)
   int raw_i = analogRead(current_sensor_pin);
-  float voltage_i = (raw_i / 4095.0) * 5.0; // ACS712 costuma operar a 5V
+  float voltage_i = (raw_i / 4095.0) * 5.0; 
   float current = (voltage_i - CURRENT_ZERO_V) / CURRENT_SENS;
-  float internal_temp = BARO.readTemperature();
-
-  // Cálculo de Percentagem (Escala NiMH 10V-14V)
   float pct = ((smoothed_voltage - BATT_MIN) / (BATT_MAX - BATT_MIN)) * 100.0;
 
-  StaticJsonDocument<256> out;
+  StaticJsonDocument<300> out;
   out["type"] = "BATTERY";
   out["voltage"] = smoothed_voltage;
   out["percentage"] = constrain(pct, 0, 100);
   out["current"] = current;
-  
-  // Se a corrente for negativa, está a carregar
+  out["temp"] = BARO.readTemperature();
   out["is_charging"] = (current < -0.15); 
-  
-  out["temperature"] = internal_temp;
   
   serializeJson(out, Serial);
   Serial.println();
