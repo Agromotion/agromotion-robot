@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class VideoStreamingManager:
     """
-    Gere a captura de vídeo da Raspberry Pi Camera usando libcamera-vid
+    Gere a captura de vídeo da Raspberry Pi Camera usando rpicam-vid
     e envia o stream via RTSP para o Mediamtx (WebRTC fan-out)
     """
 
@@ -35,7 +35,7 @@ class VideoStreamingManager:
                 return False
 
             # Esperar que o Mediamtx esteja pronto para receber o stream
-            await asyncio.sleep(3)
+            await asyncio.sleep(6)
 
             # Iniciar captura da câmara real
             if not await self._start_libcamera():
@@ -44,7 +44,7 @@ class VideoStreamingManager:
 
             self.is_streaming = True
             self.stream_start_time = datetime.now()
-            logger.info("Pipeline de vídeo iniciado com sucesso (libcamera-vid)")
+            logger.info("Pipeline de vídeo iniciado com sucesso (rpicam-vid)")
             return True
 
         except Exception as e:
@@ -58,7 +58,7 @@ class VideoStreamingManager:
             subprocess.run(["pkill", "-9", "mediamtx"], capture_output=True)
             await asyncio.sleep(0.5)
 
-            config_path = "/home/pi/agromotion-robot/raspberry/mediamtx.yml"
+            config_path = "/home/pi/raspberry/mediamtx.yml"
             command = ["mediamtx", config_path] if os.path.exists(config_path) else ["mediamtx"]
             
             self.mediamtx_process = subprocess.Popen(
@@ -83,11 +83,11 @@ class VideoStreamingManager:
             return False
 
     async def _start_libcamera(self) -> bool:
-        """Inicia o libcamera-vid e envia para o endpoint RTSP do Mediamtx"""
+        """Inicia o rpicam-vid e envia para o endpoint RTSP do Mediamtx"""
         try:
             # Comando otimizado para o hardware do Raspberry Pi
             command = [
-                "libcamera-vid",
+                "rpicam-vid",
                 "-t", "0",  # Execução contínua
                 "--codec", "h264",
                 "--width", str(config.PI_CAMERA_WIDTH),
@@ -95,7 +95,7 @@ class VideoStreamingManager:
                 "--framerate", str(config.PI_CAMERA_FPS),
                 "--bitrate", str(config.PI_CAMERA_BITRATE),
                 "--inline", # Insere headers SPS/PPS para reconexão rápida
-                "--output", f"rtsp://127.0.0.1:{config.MEDIAMTX_RTSP_PORT}/{config.MEDIAMTX_RTSP_PATH}",
+                "--output", f"rtsp://127.0.0.1:{config.MEDIAMTX_RTSP_PORT}/{config.MEDIAMTX_RTSP_PATH}?rtsp_transport=tcp",
                 "--verbose", "0"
             ]
 
@@ -109,10 +109,10 @@ class VideoStreamingManager:
             await asyncio.sleep(1)
             if self.video_process.poll() is not None:
                 _, stderr = self.video_process.communicate()
-                logger.error(f"libcamera-vid falhou: {stderr.decode()}")
+                logger.error(f"rpicam-vid falhou: {stderr.decode()}")
                 return False
 
-            logger.info(f"libcamera-vid iniciado (PID: {self.video_process.pid})")
+            logger.info(f"rpicam-vid iniciado (PID: {self.video_process.pid})")
             return True
 
         except Exception as e:
@@ -125,7 +125,7 @@ class VideoStreamingManager:
             if self.video_process:
                 self.video_process.terminate()
                 self.video_process.wait(timeout=2)
-                logger.info("libcamera-vid parado")
+                logger.info("rpicam-vid parado")
 
             if self.mediamtx_process:
                 self.mediamtx_process.terminate()

@@ -2,11 +2,7 @@
 
 ################################################################################
 # AgroMotion Robot - Unified Installation & Management Script
-#
-# Usage: bash install.sh [--help|--firmware|--check|--docs]
-#
-# This script replaces: setup.sh, START_HERE.sh, install-deps.sh,
-#                       check-installation.sh, run.sh, and other scripts
+# Raspberry Pi OS (Debian Bookworm)
 ################################################################################
 
 set -e
@@ -19,7 +15,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # Configuration
-WORK_DIR="${WORK_DIR:-/home/agromotion}"
+WORK_DIR="${WORK_DIR:-/home/pi/raspberry}"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 VENV_PATH="$WORK_DIR/venv"
 LOG_FILE="$WORK_DIR/setup.log"
@@ -88,7 +84,7 @@ check_os() {
     source /etc/os-release
 
     if [[ "$ID" != "raspbian" && "$ID" != "debian" && "$ID" != "ubuntu" ]]; then
-        warning "This script was designed for Debian-based systems (Raspbian/Ubuntu)"
+        warning "This script was designed for Debian-based systems"
         warning "Detected: $ID ($PRETTY_NAME)"
     else
         success "OS: $ID ($PRETTY_NAME)"
@@ -133,7 +129,7 @@ install_system_dependencies() {
     apt-get install -y -qq \
         git curl wget \
         python3-pip python3-venv python3-dev \
-        libopenjp2-7 libtiff5 libopus-dev libvpx-dev \
+        libopenjp2-7 libtiff6 libopus-dev libvpx-dev \
         ffmpeg libcamera-tools libffi-dev libssl-dev \
         make build-essential 2>&1 | grep -v "^Get:\|^Hit:\|^Reading" || true
 
@@ -157,140 +153,13 @@ setup_directories() {
     success "Directories created"
 }
 
-################################################################################
-# MEDIAMTX INSTALLATION
-################################################################################
-
-install_mediamtx() {
-    step "Installing Mediamtx media server"
-
-    if command -v mediamtx &> /dev/null; then
-        success "Mediamtx already installed"
-        return 0
-    fi
-
-    log "Detecting architecture..."
-    ARCH=$(uname -m)
-
-    case "$ARCH" in
-        armv7l)
-            MEDIAMTX_URL="https://github.com/bluenviron/mediamtx/releases/download/v1.4.2/mediamtx_v1.4.2_linux_armv7.tar.gz"
-            ;;
-        armv6l)
-            MEDIAMTX_URL="https://github.com/bluenviron/mediamtx/releases/download/v1.4.2/mediamtx_v1.4.2_linux_armv6.tar.gz"
-            ;;
-        aarch64)
-            MEDIAMTX_URL="https://github.com/bluenviron/mediamtx/releases/download/v1.4.2/mediamtx_v1.4.2_linux_arm64.tar.gz"
-            ;;
-        x86_64)
-            MEDIAMTX_URL="https://github.com/bluenviron/mediamtx/releases/download/v1.4.2/mediamtx_v1.4.2_linux_amd64.tar.gz"
-            ;;
-        *)
-            error "Unsupported architecture: $ARCH"
-            return 1
-            ;;
-    esac
-
-    log "Downloading Mediamtx for $ARCH..."
-    cd /tmp || return 1
-    wget -q "$MEDIAMTX_URL" -O mediamtx.tar.gz || return 1
-    tar -xzf mediamtx.tar.gz || return 1
-    mv mediamtx /usr/local/bin/ || return 1
-    chmod +x /usr/local/bin/mediamtx
-    rm -f mediamtx.tar.gz
-
-    success "Mediamtx installed"
-}
-
-################################################################################
-# PYTHON ENVIRONMENT & DEPENDENCIES
-################################################################################
-
-setup_python_env() {
-    step "Setting up Python virtual environment"
-
-    if [[ -d "$VENV_PATH" ]]; then
-        log "Virtual environment already exists"
-        success "Virtual environment ready"
-        return 0
-    fi
-
-    log "Creating virtual environment..."
-    python3 -m venv "$VENV_PATH"
-
-    log "Upgrading pip..."
-    "$VENV_PATH/bin/pip" install --upgrade pip setuptools wheel -q
-
-    success "Python virtual environment created"
-}
-
-install_python_dependencies() {
-    step "Installing Python dependencies"
-
-    if [[ ! -f "$SCRIPT_DIR/requirements.txt" ]]; then
-        warning "requirements.txt not found, using default packages..."
-        "$VENV_PATH/bin/pip" install -q \
-            psutil==5.9.6 \
-            python-dotenv==1.0.0 \
-            pyserial==3.5 \
-            firebase-admin==6.2.0 \
-            aiohttp==3.8.5 \
-            av==10.0.0 \
-            aiortc==1.5.0
-    else
-        log "Installing from requirements.txt..."
-        "$VENV_PATH/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" -q
-    fi
-
-    success "Python dependencies installed"
-}
-
-################################################################################
-# CONFIGURATION FILES
-################################################################################
-
-setup_env_file() {
-    step "Setting up environment configuration"
-
-    if [[ -f "$WORK_DIR/.env" ]]; then
-        log ".env already exists"
-        success ".env already configured"
-        return 0
-    fi
-
-    log "Creating .env file..."
-    cat > "$WORK_DIR/.env" << 'EOF'
-ROBOT_ID=agromotion-robot-01
-ROBOT_NAME=AgroMotion
-FIREBASE_CREDENTIALS_PATH=/home/agromotion/secrets/firebase-credentials.json
-FIREBASE_DATABASE_URL=https://your-project.firebaseio.com
-FIREBASE_PROJECT_ID=your-firebase-project
-ARDUINO_SERIAL_PORT=/dev/ttyUSB0
-ARDUINO_BAUD_RATE=115200
-LOG_LEVEL=INFO
-DEBUG_MODE=false
-EOF
-
-    chown ${SUDO_USER:-pi}:${SUDO_USER:-pi} "$WORK_DIR/.env" 2>/dev/null || true
-    chmod 600 "$WORK_DIR/.env"
-
-    success ".env file created (edit with: nano $WORK_DIR/.env)"
-}
-
 copy_firmware_files() {
     step "Copying firmware files"
 
     FILES=(
-        "firmware.py"
-        "config.py"
-        "serial_handler.py"
-        "system_monitor.py"
-        "video_streaming.py"
-        "command_handler.py"
-        "control_access_manager.py"
-        "telemetry_service.py"
-        "firebase_manager.py"
-        "mediamtx.yml"
+        "firmware.py" "config.py" "serial_handler.py" "system_monitor.py"
+        "video_streaming.py" "command_handler.py" "control_access_manager.py"
+        "telemetry_service.py" "firebase_manager.py" "mediamtx.yml"
     )
 
     for FILE in "${FILES[@]}"; do
@@ -309,13 +178,108 @@ copy_firmware_files() {
 }
 
 ################################################################################
-# SYSTEMD SERVICES
+# MEDIAMTX INSTALLATION
 ################################################################################
+
+install_mediamtx() {
+    step "Installing Mediamtx media server"
+
+    if command -v mediamtx &> /dev/null; then
+        success "Mediamtx already installed"
+        return 0
+    fi
+
+    log "Detecting architecture..."
+    ARCH=$(uname -m)
+
+    case "$ARCH" in
+        armv7l)  M_ARCH="armv7" ;;
+        armv6l)  M_ARCH="armv6" ;;
+        aarch64) M_ARCH="arm64" ;;
+        x86_64)  M_ARCH="amd64" ;;
+        *) error "Unsupported architecture: $ARCH"; return 1 ;;
+    esac
+
+    # Descobre a última release do mediamtx
+    LATEST_TAG=$(curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest | grep -Po '"tag_name": "\K.*?(?=")')
+    URL="https://github.com/bluenviron/mediamtx/releases/download/${LATEST_TAG}/mediamtx_${LATEST_TAG}_linux_${M_ARCH}.tar.gz"
+
+    log "Downloading Mediamtx for $ARCH..."
+    cd /tmp
+    wget -q "$URL" -O mediamtx.tar.gz
+    tar -xzf mediamtx.tar.gz
+    mv mediamtx /usr/local/bin/
+    chmod +x /usr/local/bin/mediamtx
+    rm -f mediamtx.tar.gz
+    cd "$SCRIPT_DIR"
+
+    success "Mediamtx installed"
+}
+
+################################################################################
+# PYTHON ENVIRONMENT & DEPENDENCIES
+################################################################################
+
+setup_python_env() {
+    step "Setting up Python virtual environment"
+
+    if [[ ! -d "$VENV_PATH" ]]; then
+        log "Creating virtual environment..."
+        python3 -m venv "$VENV_PATH"
+    fi
+
+    log "Upgrading pip..."
+    "$VENV_PATH/bin/pip" install --upgrade pip setuptools wheel -q
+
+    success "Python virtual environment ready"
+}
+
+install_python_dependencies() {
+    step "Installing Python dependencies"
+
+    if [[ ! -f "$SCRIPT_DIR/requirements.txt" ]]; then
+        warning "requirements.txt not found, installing base packages..."
+        "$VENV_PATH/bin/pip" install -q \
+            psutil==5.9.6 python-dotenv==1.0.0 pyserial==3.5 \
+            firebase-admin==6.2.0 aiohttp==3.8.5 av==10.0.0 aiortc==1.5.0
+    else
+        log "Installing from requirements.txt..."
+        "$VENV_PATH/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" -q
+    fi
+
+    success "Python dependencies installed"
+}
+
+################################################################################
+# CONFIGURATION FILES & SERVICES
+################################################################################
+
+setup_env_file() {
+    step "Setting up environment configuration"
+
+    if [[ -f "$WORK_DIR/.env" ]]; then
+        log ".env already exists"
+        return 0
+    fi
+
+    cat > "$WORK_DIR/.env" << EOF
+ROBOT_ID=agromotion-robot-01
+FIREBASE_CREDENTIALS_PATH=$WORK_DIR/secrets/firebase-credentials.json
+ARDUINO_SERIAL_PORT=/dev/ttyUSB0
+ARDUINO_BAUD_RATE=115200
+LOG_LEVEL=INFO
+EOF
+    chown ${SUDO_USER:-pi}:${SUDO_USER:-pi} "$WORK_DIR/.env" || true
+    chmod 600 "$WORK_DIR/.env"
+    success ".env file created"
+}
 
 create_systemd_services() {
     step "Creating systemd services"
+    check_root
+    USER_VAL=${SUDO_USER:-pi}
 
-    log "Creating mediamtx.service..."
+    # Service MediaMTX
     cat > /etc/systemd/system/mediamtx.service << EOF
 [Unit]
 Description=Mediamtx Media Server
@@ -323,19 +287,16 @@ After=network.target
 
 [Service]
 Type=simple
-User=${SUDO_USER:-pi}
+User=$USER_VAL
 WorkingDirectory=$WORK_DIR
 ExecStart=/usr/local/bin/mediamtx $WORK_DIR/mediamtx.yml
 Restart=on-failure
-RestartSec=5
-StandardOutput=append:$WORK_DIR/logs/mediamtx.log
-StandardError=append:$WORK_DIR/logs/mediamtx.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    log "Creating agromotion-firmware.service..."
+    # Service Firmware
     cat > /etc/systemd/system/agromotion-firmware.service << EOF
 [Unit]
 Description=AgroMotion Robot Firmware
@@ -343,157 +304,51 @@ After=network.target mediamtx.service
 
 [Service]
 Type=simple
-User=${SUDO_USER:-pi}
+User=$USER_VAL
 WorkingDirectory=$WORK_DIR
 Environment="PATH=$VENV_PATH/bin"
 ExecStart=$VENV_PATH/bin/python3 $WORK_DIR/firmware.py
 Restart=on-failure
-RestartSec=10
-StandardOutput=append:$WORK_DIR/logs/firmware.log
-StandardError=append:$WORK_DIR/logs/firmware.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-
     success "Systemd services created"
 }
 
 ################################################################################
-# VERIFICATION
+# VERIFICATION & RUN
 ################################################################################
 
 check_installation() {
     step "Checking installation"
-
     local MISSING=0
 
-    # Python 3
-    if command -v python3 &> /dev/null; then
-        success "Python 3 installed"
-    else
-        error "Python 3 not found"
-        MISSING=$((MISSING + 1))
-    fi
-
-    # Virtual environment
-    if [[ -d "$VENV_PATH" ]]; then
-        success "Virtual environment exists"
-    else
-        warning "Virtual environment not found"
-        MISSING=$((MISSING + 1))
-    fi
-
-    # Python modules
-    if [[ -d "$VENV_PATH" ]]; then
-        if "$VENV_PATH/bin/python3" -c "import psutil, serial" 2>/dev/null; then
-            success "Python modules installed"
-        else
-            warning "Some Python modules missing"
-            MISSING=$((MISSING + 1))
-        fi
-    fi
-
-    # Mediamtx
-    if command -v mediamtx &> /dev/null; then
-        success "Mediamtx installed"
-    else
-        warning "Mediamtx not found"
-        MISSING=$((MISSING + 1))
-    fi
-
-    # Firmware files
-    if [[ -f "$WORK_DIR/firmware.py" ]]; then
-        success "Firmware files exist"
-    else
-        warning "Firmware files not found in $WORK_DIR"
-        MISSING=$((MISSING + 1))
-    fi
-
-    # Configuration
-    if [[ -f "$WORK_DIR/.env" ]]; then
-        success ".env configuration exists"
-    else
-        warning ".env configuration not found"
-        MISSING=$((MISSING + 1))
-    fi
+    command -v python3 &> /dev/null && success "Python 3 installed" || { error "Python 3 missing"; MISSING=$((MISSING+1)); }
+    [ -d "$VENV_PATH" ] && success "Virtual environment OK" || { warning "Venv missing"; MISSING=$((MISSING+1)); }
+    command -v mediamtx &> /dev/null && success "Mediamtx OK" || { warning "Mediamtx missing"; MISSING=$((MISSING+1)); }
+    [ -f "$WORK_DIR/firmware.py" ] && success "Firmware files OK" || { warning "Files missing"; MISSING=$((MISSING+1)); }
 
     echo ""
     if [[ $MISSING -eq 0 ]]; then
         success "All checks passed!"
-        return 0
     else
         warning "$MISSING issues found"
-        return 1
     fi
 }
-
-################################################################################
-# FIRMWARE EXECUTION
-################################################################################
 
 run_firmware() {
     local MODE="${1:-camera}"
-
-    step "Running firmware"
-
-    # Check if not in venv
-    if [[ -z "$VIRTUAL_ENV" && -d "$VENV_PATH" ]]; then
-        log "Activating virtual environment..."
-        source "$VENV_PATH/bin/activate"
-    fi
-
-    # Check Python dependencies
-    if ! python3 -c "import psutil" 2>/dev/null; then
-        warning "Dependencies not installed, installing now..."
-        install_python_dependencies
-        source "$VENV_PATH/bin/activate"
-    fi
-
-    # Check .env
-    if [[ ! -f "$WORK_DIR/.env" ]]; then
-        log "Creating .env configuration..."
-        setup_env_file
-    fi
-
-    log "Starting firmware with mode: $MODE"
-    cd "$WORK_DIR" || exit 1
-    python3 firmware.py "$MODE"
+    step "Running firmware mode: $MODE"
+    cd "$WORK_DIR"
+    "$VENV_PATH/bin/python3" firmware.py "$MODE"
 }
 
-################################################################################
-# DOCUMENTATION
-################################################################################
-
 show_documentation() {
-    step "AgroMotion Robot Documentation"
-
-    # Look for documentation in various places
-    local DOC_PATH=""
-    
-    if [[ -f "$SCRIPT_DIR/../DOCUMENTATION.md" ]]; then
-        DOC_PATH="$SCRIPT_DIR/../DOCUMENTATION.md"
-    elif [[ -f "$SCRIPT_DIR/DOCUMENTATION.md" ]]; then
-        DOC_PATH="$SCRIPT_DIR/DOCUMENTATION.md"
-    elif [[ -f "./DOCUMENTATION.md" ]]; then
-        DOC_PATH="./DOCUMENTATION.md"
-    elif [[ -f "$SCRIPT_DIR/readme.md" ]]; then
-        DOC_PATH="$SCRIPT_DIR/readme.md"
-    else
-        error "Documentation file not found"
-        return 1
-    fi
-
-    log "Documentation file: $DOC_PATH"
-    log "Press 'q' to exit the documentation viewer\n"
-    
-    if command -v less &> /dev/null; then
-        less "$DOC_PATH"
-    else
-        cat "$DOC_PATH"
-    fi
+    step "AgroMotion Documentation"
+    [ -f "$SCRIPT_DIR/readme.md" ] && less "$SCRIPT_DIR/readme.md" || error "readme.md not found"
 }
 
 ################################################################################
@@ -502,68 +357,33 @@ show_documentation() {
 
 show_menu() {
     clear
-
-    cat << 'EOF'
-
-________________________________________________________
- AgroMotion Robot - Installation & Management
-________________________________________________________
-
-What would you like to do?
-
- 1) Full setup (install everything - requires root)
- 2) Check installation status
- 3) Show documentation
- 4) Install Python dependencies only
- 5) Run firmware
- 6) Exit
-
-________________________________________________________
-
-EOF
-
-    read -p "Select option (1-6): " choice
+    echo "________________________________________________________"
+    echo " AgroMotion Robot - Installation & Management"
+    echo "________________________________________________________"
+    echo " 1) Full setup (System + Mediamtx + Venv + Services)"
+    echo " 2) Check installation status"
+    echo " 3) Show documentation"
+    echo " 4) Install Python dependencies only"
+    echo " 5) Run firmware (camera)"
+    echo " 6) Run firmware (video)"
+    echo " 7) Update Firmware Files (Copy from current folder)"
+    echo " 8) Exit"
+    echo "________________________________________________________"
+    read -p "Select option (1-8): " choice
 
     case $choice in
-        1)
-            check_root
-            install_system_dependencies
-            setup_directories
-            install_mediamtx
-            setup_python_env
-            install_python_dependencies
-            copy_firmware_files
-            setup_env_file
-            create_systemd_services
-            log "Next: edit .env with your configuration"
-            log "Then: sudo systemctl start agromotion-firmware.service"
-            ;;
-        2)
-            check_installation
-            ;;
-        3)
-            show_documentation
-            ;;
-        4)
-            setup_python_env
-            install_python_dependencies
-            ;;
-        5)
-            read -p "Enter firmware mode (camera/video) [camera]: " mode
-            mode=${mode:-camera}
-            run_firmware "$mode"
-            ;;
-        6)
-            echo "Goodbye!"
-            exit 0
-            ;;
-        *)
-            error "Invalid option"
-            sleep 1
-            show_menu
-            ;;
+        1) check_root; check_os; check_python; check_disk_space; 
+           install_system_dependencies; setup_directories; install_mediamtx; 
+           setup_python_env; install_python_dependencies; copy_firmware_files; 
+           setup_env_file; create_systemd_services ;;
+        2) check_installation ;;
+        3) show_documentation ;;
+        4) setup_python_env; install_python_dependencies ;;
+        5) run_firmware "camera" ;;
+        6) run_firmware "video" ;;
+        7) copy_firmware_files ;;
+        8) exit 0 ;;
     esac
-
     read -p "Press Enter to continue..."
     show_menu
 }
@@ -573,56 +393,16 @@ EOF
 ################################################################################
 
 main() {
-    # Create log directory if needed
     mkdir -p "$WORK_DIR" 2>/dev/null || true
-    > "$LOG_FILE"
-
-    # Parse command line arguments
+    
     case "${1:-}" in
-        --help)
-            show_help
-            exit 0
-            ;;
-        --setup)
-            check_root
-            install_system_dependencies
-            setup_directories
-            install_mediamtx
-            setup_python_env
-            install_python_dependencies
-            copy_firmware_files
-            setup_env_file
-            create_systemd_services
-            check_installation
-            ;;
-        --check)
-            check_installation
-            ;;
-        --docs)
-            show_documentation
-            ;;
-        --deps)
-            setup_python_env
-            install_python_dependencies
-            ;;
-        --firmware)
-            if [[ -z "${2:-}" ]]; then
-                error "Usage: bash install.sh --firmware [camera|video]"
-                exit 1
-            fi
-            run_firmware "$2"
-            ;;
-        "")
-            # No arguments - show interactive menu
-            show_menu
-            ;;
-        *)
-            error "Unknown option: $1"
-            show_help
-            exit 1
-            ;;
+        --help) show_help ;;
+        --setup) install_system_dependencies; setup_directories; install_mediamtx; setup_python_env; install_python_dependencies; copy_firmware_files; setup_env_file; create_systemd_services ;;
+        --check) check_installation ;;
+        --firmware) run_firmware "${2:-camera}" ;;
+        "") show_menu ;;
+        *) error "Unknown option: $1"; show_help; exit 1 ;;
     esac
 }
 
-# Run
 main "$@"

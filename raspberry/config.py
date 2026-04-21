@@ -45,7 +45,7 @@ ARDUINO_READ_INTERVAL = 0.1  # seconds
 # ============================================================================
 FIREBASE_CREDENTIALS_PATH = os.getenv(
     "FIREBASE_CREDENTIALS_PATH",
-    "/home/pi/agromotion-robot/raspberry/production/secrets.json"
+    "/home/pi/raspberry/secrets.json"
 )
 FIREBASE_DATABASE_URL = os.getenv(
     "FIREBASE_DATABASE_URL",

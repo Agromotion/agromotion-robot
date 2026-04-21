@@ -2,6 +2,7 @@ import logging
 import asyncio
 import json
 from typing import Dict, Any, Optional, Callable
+from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
@@ -36,6 +37,16 @@ class FirebaseManager:
             
             self.db = firestore.client()
             self.doc_ref = self.db.collection('robots').document(self.robot_id)
+            
+            # --- LIMPEZA DE SESSÕES ANTIGAS ---
+            logger.info("Limpando sessões WebRTC antigas e candidatos...")
+            self.doc_ref.update({
+                'webrtc_session': None,
+                'app_candidates': [],
+                'robot_candidates': []
+            })
+            # ----------------------------------
+
             self.notification_service = NotificationService(self.db, self.robot_id)
             
             self._start_firestore_listener()
@@ -85,9 +96,25 @@ class FirebaseManager:
         self._snapshot_listener = self.doc_ref.on_snapshot(on_snapshot)
 
     async def _handle_webrtc_offer(self, offer_data, app_candidates):
-        pc = RTCPeerConnection()
+        # Configuração TURN/STUN para acesso global
+        ice_servers = [
+            RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+            RTCIceServer(
+                urls=["turn:openrelay.metered.ca:80"],
+                username="openrelayproject",
+                credential="openrelayproject"
+            ),
+            RTCIceServer(
+                urls=["turn:openrelay.metered.ca:443"],
+                username="openrelayproject",
+                credential="openrelayproject"
+            )
+        ]
+        
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
         self.pcs.add(pc)
 
+        # Handler do DataChannel para comandos
         @pc.on("datachannel")
         def on_datachannel(channel):
             @channel.on("message")
@@ -102,31 +129,53 @@ class FirebaseManager:
                 except: pass
 
         try:
-            player = MediaPlayer('rtsp://localhost:8554/robot', options={'rtsp_transport': 'tcp'})
-            if player.video: pc.addTrack(player.video)
+            # Captura o vídeo do MediaMTX (que já vimos funcionar no browser)
+            player = MediaPlayer('rtsp://127.0.0.1:8554/robot', options={
+                'rtsp_transport': 'tcp',
+                'stimeout': '5000000'
+            })
+            if player.video:
+                pc.addTrack(player.video)
             
+            # Define a oferta remota
             await pc.setRemoteDescription(RTCSessionDescription(offer_data['sdp'], offer_data['type']))
-            for c in app_candidates:
-                await pc.addIceCandidate(RTCIceCandidate(c['candidate'], c['sdpMid'], c['sdpMLineIndex']))
             
+            # Adiciona os candidatos da App (CORREÇÃO DE ARGUMENTOS)
+            if app_candidates:
+                for c in app_candidates:
+                    try:
+                        # Passamos apenas os valores por ordem: candidate, sdpMid, sdpMLineIndex
+                        cand = RTCIceCandidate(
+                            str(c.get('candidate')), 
+                            str(c.get('sdpMid', '0')), 
+                            int(c.get('sdpMLineIndex', 0))
+                        )
+                        await pc.addIceCandidate(cand)
+                    except Exception as ice_err:
+                        logger.warning(f"Candidato ignorado: {ice_err}")
+            
+            # Gera e envia a resposta
             answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
+            
             self.doc_ref.update({
-                'webrtc_session.answer': {'sdp': pc.localDescription.sdp, 'type': pc.localDescription.type}
+                'webrtc_session.answer': {
+                    'sdp': pc.localDescription.sdp, 
+                    'type': pc.localDescription.type
+                }
             })
+            logger.info("✓ Resposta WebRTC enviada com sucesso.")
+            
         except Exception as e:
-            logger.error(f"WebRTC Error: {e}")
+            logger.error(f"Erro no Handshake: {e}")
 
     async def save_telemetry(self, data: Dict[str, Any]):
         if self.initialized:
-
-            # 1. Atualiza o estado ATUAL (para o Dashboard ver agora)
             self.doc_ref.set({
                 'telemetry': data,
                 'status': {'online': True, 'last_update': firestore.SERVER_TIMESTAMP}
             }, merge=True)
 
-            # 2. Grava no HISTÓRICO (Sub-coleção)
             try:
                 self.doc_ref.collection('telemetry_history').add(data)
             except Exception as e:
