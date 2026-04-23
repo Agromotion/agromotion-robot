@@ -225,22 +225,26 @@ class FirebaseManager:
                 self.pc.addTrack(player.video)
                 logger.info("✓ Track de vídeo adicionada.")
 
-            # Handshake
-            try:
-                answer = await self.pc.createAnswer()
-                await self.pc.setLocalDescription(answer)
-            except Exception as e:
-                logger.error(f"Erro na negociação SDP: {e}")
-                self._handling_offer = False
-                return
+            offer = RTCSessionDescription(offer_data['sdp'], offer_data['type'])
+            await self.pc.setRemoteDescription(offer)
+            self._remote_description_set = True
+            
+            answer = await self.pc.createAnswer()
+            await self.pc.setLocalDescription(answer)
+
+            await self._flush_pending_candidates()
 
             self.doc_ref.update({
                 'webrtc_session.answer': {'sdp': self.pc.localDescription.sdp, 'type': self.pc.localDescription.type}
             })
-            logger.info("✓ Answer enviada.")
+            logger.info("✓ Handshake WebRTC concluído com sucesso.")
 
         except Exception as e:
-            logger.error(f"Erro Handshake: {e}")
+            logger.error(f"Erro na negociação SDP: {e}")
+            # Se falhar, limpamos tudo para a próxima tentativa
+            if self.pc:
+                await self.pc.close()
+                self.pc = None
         finally:
             self._handling_offer = False
 
