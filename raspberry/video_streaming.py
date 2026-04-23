@@ -1,6 +1,6 @@
 """
 Integração de streaming de vídeo com Mediamtx
-Gere a captura da libcamera e faz o stream via RTSP para o Mediamtx
+Gere a captura da libcamera + FFmpeg e faz o stream via RTSP
 """
 
 import subprocess
@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 class VideoStreamingManager:
     """
-    Gere a captura de vídeo da Raspberry Pi Camera usando rpicam-vid
-    e envia o stream via RTSP para o Mediamtx (WebRTC fan-out)
+    Gere a captura de vídeo da Raspberry Pi Camera usando rpicam-vid,
+    estabiliza via FFmpeg e envia para o Mediamtx para WebRTC fan-out.
     """
 
     def __init__(self):
@@ -30,21 +30,22 @@ class VideoStreamingManager:
     async def start(self) -> bool:
         """Inicia o servidor Mediamtx e o pipeline de captura da câmara"""
         try:
-            # Iniciar Mediamtx
+            # 1. Iniciar Mediamtx
             if not await self._start_mediamtx():
                 return False
 
-            # Esperar que o Mediamtx esteja pronto para receber o stream
-            await asyncio.sleep(6)
+            # 2. Esperar que o Mediamtx esteja pronto para receber o stream
+            # Essencial para evitar o erro "failed to open output"
+            await asyncio.sleep(5)
 
-            # Iniciar captura da câmara real
-            if not await self._start_libcamera():
+            # 3. Iniciar o pipeline de vídeo estabilizado
+            if not await self._start_video_pipeline():
                 await self.stop()
                 return False
 
             self.is_streaming = True
             self.stream_start_time = datetime.now()
-            logger.info("Pipeline de vídeo iniciado com sucesso (rpicam-vid)")
+            logger.info("✓ Streaming de vídeo iniciado (rpicam-vid + FFmpeg)")
             return True
 
         except Exception as e:
@@ -54,7 +55,7 @@ class VideoStreamingManager:
     async def _start_mediamtx(self) -> bool:
         """Inicia o servidor de media Mediamtx"""
         try:
-            # Matar instâncias antigas para evitar conflitos de porta (RTSP/WebRTC)
+            # Limpar instâncias anteriores
             subprocess.run(["pkill", "-9", "mediamtx"], capture_output=True)
             await asyncio.sleep(0.5)
 
@@ -72,90 +73,91 @@ class VideoStreamingManager:
 
             await asyncio.sleep(1)
             if self.mediamtx_process.poll() is not None:
-                logger.error("Mediamtx falhou ao iniciar (Processo terminou precocemente)")
+                logger.error("Mediamtx falhou ao iniciar.")
                 return False
 
-            logger.info(f"Mediamtx iniciado (PID: {self.mediamtx_process.pid})")
+            logger.info(f"Mediamtx pronto (PID: {self.mediamtx_process.pid})")
             return True
 
         except Exception as e:
-            logger.error(f"Falha ao iniciar Mediamtx: {e}")
+            logger.error(f"Erro ao iniciar Mediamtx: {e}")
             return False
 
-    async def _start_libcamera(self) -> bool:
-        """Inicia o rpicam-vid e envia para o endpoint RTSP do Mediamtx"""
+    async def _start_video_pipeline(self) -> bool:
+        """Inicia o rpicam-vid em pipe para o FFmpeg"""
         try:
-            # Comando otimizado para o hardware do Raspberry Pi
-            command = [
-                "rpicam-vid",
-                "-t", "0",  # Execução contínua
-                "--codec", "h264",
-                "--width", str(config.PI_CAMERA_WIDTH),
-                "--height", str(config.PI_CAMERA_HEIGHT),
-                "--framerate", str(config.PI_CAMERA_FPS),
-                "--bitrate", str(config.PI_CAMERA_BITRATE),
-                "--inline", # Insere headers SPS/PPS para reconexão rápida
-                "--output", f"rtsp://127.0.0.1:{config.MEDIAMTX_RTSP_PORT}/{config.MEDIAMTX_RTSP_PATH}?rtsp_transport=tcp",
-                "--verbose", "0"
-            ]
+            # Construção do pipeline usando as variáveis do config.py
+            # Usamos o FFmpeg como ponte para garantir que o RTSP não falha
+            pipeline_cmd = (
+                f"rpicam-vid -t 0 --inline --nopreview "
+                f"--width {config.PI_CAMERA_WIDTH} "
+                f"--height {config.PI_CAMERA_HEIGHT} "
+                f"--framerate {config.PI_CAMERA_FPS} "
+                f"--codec h264 -o - | "
+                f"ffmpeg -i - -vcodec copy -f rtsp -rtsp_transport tcp "
+                f"rtsp://127.0.0.1:{config.MEDIAMTX_RTSP_PORT}/{config.MEDIAMTX_RTSP_PATH}"
+            )
 
             self.video_process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                pipeline_cmd,
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 preexec_fn=self._ignore_sigint
             )
 
-            await asyncio.sleep(1)
+            # Verificar se o pipeline sobreviveu ao arranque
+            await asyncio.sleep(2)
             if self.video_process.poll() is not None:
-                _, stderr = self.video_process.communicate()
-                logger.error(f"rpicam-vid falhou: {stderr.decode()}")
                 return False
 
-            logger.info(f"rpicam-vid iniciado (PID: {self.video_process.pid})")
+            logger.info("Pipeline de vídeo ativo.")
             return True
 
         except Exception as e:
-            logger.error(f"Falha ao iniciar libcamera: {e}")
+            logger.error(f"Erro ao lançar pipeline: {e}")
             return False
 
     async def stop(self):
-        """Pára todos os processos de vídeo de forma limpa"""
+        """Pára todos os processos de forma limpa e agressiva para libertar a câmara"""
         try:
-            if self.video_process:
-                self.video_process.terminate()
-                self.video_process.wait(timeout=2)
-                logger.info("rpicam-vid parado")
-
+            # Matar processos específicos do pipeline
+            subprocess.run(["pkill", "-9", "-f", "rpicam-vid"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "ffmpeg"], capture_output=True)
+            
             if self.mediamtx_process:
                 self.mediamtx_process.terminate()
                 self.mediamtx_process.wait(timeout=2)
-                logger.info("Mediamtx parado")
+                logger.info("Serviços de vídeo encerrados.")
 
             self.is_streaming = False
+            self.stream_start_time = None
         except Exception as e:
             logger.error(f"Erro ao parar streaming: {e}")
 
     def get_stream_info(self) -> Dict[str, Any]:
-        """Retorna informações do estado do stream para a telemetria"""
-        uptime = (datetime.now() - self.stream_start_time).total_seconds() if self.stream_start_time else 0
+        """Retorna informações do estado do stream para a telemetria do Firebase"""
+        uptime = 0
+        if self.stream_start_time:
+            uptime = (datetime.now() - self.stream_start_time).total_seconds()
+            
         return {
             "is_streaming": self.is_streaming,
-            "uptime": uptime,
+            "uptime": round(uptime, 1),
             "resolution": f"{config.PI_CAMERA_WIDTH}x{config.PI_CAMERA_HEIGHT}",
             "fps": config.PI_CAMERA_FPS,
             "url": f"rtsp://127.0.0.1:{config.MEDIAMTX_RTSP_PORT}/{config.MEDIAMTX_RTSP_PATH}"
         }
 
     def health_check(self) -> bool:
-        """Verifica se os processos estão vivos"""
-        return (
-            self.is_streaming and
-            self.mediamtx_process and self.mediamtx_process.poll() is None and
-            self.video_process and self.video_process.poll() is None
-        )
+        """Verifica se os processos críticos estão vivos"""
+        # Para o pipeline com shell=True, verificamos se o processo pai ainda existe
+        mediamtx_alive = self.mediamtx_process and self.mediamtx_process.poll() is None
+        video_alive = self.video_process and self.video_process.poll() is None
+        
+        return self.is_streaming and mediamtx_alive and video_alive
 
     @staticmethod
     def _ignore_sigint():
-        """Impede que Ctrl+C mate os subprocessos antes do firmware principal"""
+        """Evita que o sinal de interrupção mate os subprocessos prematuramente"""
         signal.signal(signal.SIGINT, signal.SIG_IGN)

@@ -14,94 +14,78 @@ logger = logging.getLogger(__name__)
 
 class ControlAccessManager:
     """
-    Manages exclusive control access to the robot
+    Gere o acesso exclusivo de controlo ao robô.
     
-    - Only ONE user can send commands at a time
-    - Other users can see who is controlling
-    - Control is released when user disconnects or after timeout
-    - New user takes control when previous user releases it
+    - Apenas UM utilizador pode enviar comandos de cada vez (FIFO).
+    - Outros utilizadores podem ver quem está a controlar e a sua posição na fila.
+    - O controlo é libertado por desconexão, timeout de inatividade ou saída manual.
     """
 
     def __init__(self):
-        self.current_controller: Optional[str] = None  # email of controlling user
+        self.current_controller: Optional[str] = None  # Email do utilizador ativo
         self.control_lock_time: Optional[datetime] = None
         self.control_timeout = timedelta(seconds=config.CONTROL_LOCK_TIMEOUT)
         self.last_activity_time: Optional[datetime] = None
-        self.activity_update_interval = config.CONTROL_LOCK_ACTIVITY_INTERVAL
         
-        # Queue of users waiting to control
+        # Fila de utilizadores à espera (FIFO)
         self.control_queue: list = []
         
-        # Statistics
+        # Estatísticas
         self.total_control_sessions = 0
         self.current_session_start = None
 
     def request_control(self, user_email: str) -> Dict[str, Any]:
         """
-        User requests to take control
-        
-        Returns:
-            {
-                "granted": bool,
-                "message": str,
-                "current_controller": str or None,
-                "time_until_available": int or None  # seconds
-            }
+        Utilizador solicita controlo. Se livre, assume. Se ocupado, entra na fila.
         """
-        
-        # Check if control is available
+        # 1. Se estiver livre, concede imediatamente
         if self.current_controller is None:
-            # No one controlling - grant control
             return self._grant_control(user_email)
         
+        # 2. Se for o próprio utilizador ativo, atualiza atividade
         if self.current_controller == user_email:
-            # Same user - just update activity
             self._update_activity()
             return {
                 "granted": True,
-                "message": "You have control",
+                "message": "Já tens o controlo ativo.",
                 "current_controller": user_email,
                 "time_until_available": None
             }
         
-        # Different user is controlling
+        # 3. Verifica se o controlo atual expirou por inatividade
         if self._is_control_expired():
-            # Control timed out - release and grant to new user
-            logger.info(f"Control timeout for {self.current_controller}, releasing...")
+            logger.info(f"Timeout de inatividade para {self.current_controller}. Rodando fila...")
             self._release_control()
             return self._grant_control(user_email)
         
-        # Control is locked - add to queue if not already there
+        # 4. Está ocupado: adiciona à fila se ainda não estiver lá
         if user_email not in self.control_queue:
             self.control_queue.append(user_email)
-        
-        time_until = self._get_time_until_available()
+            logger.info(f"Utilizador {user_email} adicionado à fila de espera.")
         
         return {
             "granted": False,
-            "message": f"Robot is being controlled by {self.current_controller}",
+            "message": f"O robô está a ser controlado por {self.current_controller}",
             "current_controller": self.current_controller,
-            "time_until_available": time_until,
+            "time_until_available": self._get_time_until_available(),
             "position_in_queue": self.control_queue.index(user_email) + 1
         }
 
     def release_control(self, user_email: str) -> Dict[str, Any]:
         """
-        User releases control (e.g., disconnects or leaves screen)
-        
-        Returns info about who gets control next
+        Liberta o controlo (desconexão ou saída manual). 
+        Retorna o próximo utilizador na fila para promoção.
         """
-        
         if self.current_controller != user_email:
             return {
                 "released": False,
-                "message": f"You don't have control (current: {self.current_controller})"
+                "message": "Não tens o controlo ativo."
             }
         
-        logger.info(f"✓ Control released by {user_email}")
+        logger.info(f"✓ Controlo libertado por {user_email}")
         self._release_control()
         
-        # Grant control to next user in queue
+        # Promove o próximo da fila
         next_controller = None
         if self.control_queue:
             next_controller = self.control_queue.pop(0)
@@ -109,155 +93,104 @@ class ControlAccessManager:
             
             return {
                 "released": True,
-                "message": f"Control released. {next_controller} now has control",
+                "message": f"Controlo passado para {next_controller}",
                 "next_controller": next_controller
             }
         
         return {
             "released": True,
-            "message": "Control released. Robot idle",
+            "message": "Controlo libertado. Robô em standby.",
             "next_controller": None
         }
 
     def update_activity(self, user_email: str) -> bool:
-        """
-        Update last activity time for current controller
-        Call this periodically to prevent timeout
-        """
-        
+        """Atualiza timestamp de atividade para evitar timeout."""
         if self.current_controller != user_email:
             return False
-        
         self._update_activity()
         return True
 
     def get_control_status(self) -> Dict[str, Any]:
-        """Get current control status"""
-        
-        # Check for timeout
+        """Retorna o estado atual do controlo e verifica expiração."""
         if self.current_controller and self._is_control_expired():
-            logger.warning("Control expired, releasing...")
+            logger.warning(f"Controlo de {self.current_controller} expirou.")
             self._release_control()
-        
-        time_until = self._get_time_until_available()
-        
+            
+            # Promove automaticamente o próximo se existir
+            if self.control_queue:
+                next_user = self.control_queue.pop(0)
+                self._grant_control(next_user)
+
         return {
             "is_controlled": self.current_controller is not None,
             "current_controller": self.current_controller,
-            "is_available": self.current_controller is None,
-            "time_until_available": time_until,
-            "queue_position": self._get_queue_position(),
             "queue_length": len(self.control_queue),
-            "session_duration": self._get_session_duration(),
+            "time_until_available": self._get_time_until_available(),
             "total_sessions": self.total_control_sessions
         }
 
     def add_to_queue(self, user_email: str) -> int:
-        """Add user to control queue, return position"""
-        if user_email not in self.control_queue:
+        if user_email not in self.control_queue and user_email != self.current_controller:
             self.control_queue.append(user_email)
-        return self.control_queue.index(user_email) + 1
+        return self.control_queue.index(user_email) + 1 if user_email in self.control_queue else 0
 
     def remove_from_queue(self, user_email: str) -> bool:
-        """Remove user from queue"""
         if user_email in self.control_queue:
             self.control_queue.remove(user_email)
             return True
         return False
 
     # ========================================================================
-    # Private methods
+    # Métodos Privados
     # ========================================================================
 
     def _grant_control(self, user_email: str) -> Dict[str, Any]:
-        """Internal: Grant control to user"""
-        
         self.current_controller = user_email
         self.control_lock_time = datetime.now()
         self.last_activity_time = datetime.now()
         self.current_session_start = datetime.now()
         self.total_control_sessions += 1
         
-        # Remove from queue if there
         if user_email in self.control_queue:
             self.control_queue.remove(user_email)
         
-        logger.info(f"✓ Control granted to {user_email}")
-        
+        logger.info(f"▶ CONTROLO CONCEDIDO A: {user_email}")
         return {
             "granted": True,
-            "message": f"Control granted to {user_email}",
+            "message": "Controlo concedido.",
             "current_controller": user_email,
             "time_until_available": None
         }
 
     def _release_control(self):
-        """Internal: Release control"""
         self.current_controller = None
         self.control_lock_time = None
         self.last_activity_time = None
         self.current_session_start = None
 
     def _update_activity(self):
-        """Internal: Update last activity timestamp"""
         self.last_activity_time = datetime.now()
 
     def _is_control_expired(self) -> bool:
-        """Check if control has timed out"""
         if not self.current_controller or not self.last_activity_time:
             return False
-        
-        time_elapsed = datetime.now() - self.last_activity_time
-        return time_elapsed > self.control_timeout
+        return (datetime.now() - self.last_activity_time) > self.control_timeout
 
     def _get_time_until_available(self) -> Optional[int]:
-        """Get seconds until control becomes available"""
-        
-        if self.current_controller is None:
-            return 0
-        
-        if not self.last_activity_time:
-            return None
+        if self.current_controller is None: return 0
+        if not self.last_activity_time: return None
         
         time_elapsed = datetime.now() - self.last_activity_time
         time_until = self.control_timeout - time_elapsed
-        
         seconds = max(0, int(time_until.total_seconds()))
         return seconds if seconds > 0 else None
 
-    def _get_queue_position(self) -> Optional[int]:
-        """Get current user's position in queue"""
-        # Would need to know current user - implemented at higher level
-        return None
-
     def _get_session_duration(self) -> Optional[int]:
-        """Get current session duration in seconds"""
-        if not self.current_session_start:
-            return None
-        
-        duration = datetime.now() - self.current_session_start
-        return int(duration.total_seconds())
-
-    def get_detailed_status(self) -> Dict[str, Any]:
-        """Get detailed control status for logging/debug"""
-        
-        return {
-            "current_controller": self.current_controller,
-            "is_controlled": self.current_controller is not None,
-            "control_duration_seconds": self._get_session_duration(),
-            "time_until_timeout": self._get_time_until_available(),
-            "control_timeout_seconds": config.CONTROL_LOCK_TIMEOUT,
-            "queue": self.control_queue,
-            "queue_length": len(self.control_queue),
-            "total_sessions": self.total_control_sessions,
-            "last_activity": self.last_activity_time.isoformat() if self.last_activity_time else None,
-        }
+        if not self.current_session_start: return None
+        return int((datetime.now() - self.current_session_start).total_seconds())
 
     def reset(self):
-        """Reset all control state (for testing/reset)"""
-        self.current_controller = None
-        self.control_lock_time = None
-        self.last_activity_time = None
-        self.current_session_start = None
+        """Reset total do estado (limpeza de boot)."""
+        self._release_control()
         self.control_queue = []
-        logger.info("Control state reset")
+        logger.info("Estado de controlo resetado.")

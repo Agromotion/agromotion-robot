@@ -8,7 +8,6 @@ import logging
 from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, asdict
 from datetime import datetime
-import json
 
 import config
 from system_monitor import SystemMonitor
