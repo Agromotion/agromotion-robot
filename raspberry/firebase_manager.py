@@ -24,7 +24,7 @@ class FirebaseManager:
         self.robot = robot_instance
         self.notification_service = None
         self._handling_offer = False
-        
+
         # Gestão de Acesso e Fila
         self.access_manager = ControlAccessManager()
         self.current_controller = None
@@ -50,8 +50,6 @@ class FirebaseManager:
             self.doc_ref = self.db.collection('robots').document(self.robot_id)
 
             logger.info("Limpando sessões WebRTC e reiniciando fila de controlo...")
-            
-            # Reset total no arranque do Robô
             self.doc_ref.update({
                 'webrtc_session': None,
                 'app_candidates': [],
@@ -65,9 +63,7 @@ class FirebaseManager:
             })
 
             self.notification_service = NotificationService(self.db, self.robot_id)
-            self._start_firestore_listener()
             
-            # Iniciar monitor de timeout de controlo
             asyncio.run_coroutine_threadsafe(self._control_timeout_loop(), self.loop)
 
             self.connected = True
@@ -83,23 +79,22 @@ class FirebaseManager:
         def on_snapshot(doc_snapshot, changes, read_time):
             for doc in doc_snapshot:
                 data = doc.to_dict()
-                if not data: continue
+                if not data:
+                    continue
 
                 # 1. TRATAMENTO DE HANDSHAKE (OFFER)
                 session = data.get('webrtc_session')
                 control_data = data.get('control', {})
-                # A App deve enviar este campo para sabermos quem colocar na fila
                 app_email = control_data.get('last_handshake_email')
 
                 if session and session.get('offer') and not session.get('answer'):
                     if not self._handling_offer:
                         self._handling_offer = True
-                        
-                        # Tentar registar na fila de controlo
                         if app_email:
                             self.access_manager.request_control(app_email)
+                            self.current_controller = self.access_manager.current_controller
                             self._sync_control_state()
-
+                            self._handling_offer = True
                         logger.info(f"📡 Oferta WebRTC de {app_email}. Iniciando conexão...")
                         asyncio.run_coroutine_threadsafe(
                             self._handle_webrtc_offer(session['offer']),
@@ -108,15 +103,19 @@ class FirebaseManager:
 
                 # 2. CANDIDATOS ICE
                 app_candidates = data.get('app_candidates', [])
-                if app_candidates and self.pc and self._remote_description_set:
+                if app_candidates:
                     for cand_data in app_candidates:
                         cand_str = cand_data.get('candidate')
                         if cand_str and cand_str not in self._processed_app_candidates:
                             self._processed_app_candidates.add(cand_str)
-                            asyncio.run_coroutine_threadsafe(
-                                self._add_ice_candidate(cand_data),
-                                self.loop
-                            )
+                            if self.pc and self._remote_description_set:
+                                asyncio.run_coroutine_threadsafe(
+                                    self._add_ice_candidate(cand_data),
+                                    self.loop
+                                )
+                            else:
+                                logger.debug("Candidato ICE em fila (remote description ainda não definida).")
+                                self._pending_candidates.append(cand_data)
 
         self._snapshot_listener = self.doc_ref.on_snapshot(on_snapshot)
 
@@ -134,13 +133,10 @@ class FirebaseManager:
         """Liberta o controlo atual e passa para o próximo na fila."""
         if self.current_controller:
             self.access_manager.release_control(self.current_controller)
-        
         status = self.access_manager.get_control_status()
         next_user = status['current_controller']
         self.current_controller = next_user
-        
         self._sync_control_state()
-        
         if self.on_control_change:
             self.on_control_change(next_user, next_user is not None)
 
@@ -153,121 +149,250 @@ class FirebaseManager:
         })
 
     async def _wait_for_stream_ready(self, path="robot", timeout=20) -> bool:
+        """Verifica via API do MediaMTX se o stream está activo."""
         url = "http://127.0.0.1:9997/v3/paths/list"
         async with aiohttp.ClientSession() as session:
             for i in range(timeout // 2):
                 try:
-                    async with session.get(url, timeout=2) as resp:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             for item in data.get("items", []):
-                                if item.get("name") == path and item.get("ready"):
-                                    return True
-                except: pass
+                                if item.get("name") == path:
+                                    # Compatibilidade com diferentes versões do MediaMTX
+                                    is_ready = (
+                                        item.get("ready") is True or
+                                        item.get("readyTime") is not None or
+                                        item.get("bytesReceived", 0) > 0 or
+                                        len(item.get("tracks", [])) > 0
+                                    )
+                                    if is_ready:
+                                        logger.info(f"✓ Stream '{path}' confirmado (tentativa {i+1})")
+                                        return True
+                                    logger.warning(f"Path '{path}' existe mas não está ready ainda.")
+                except Exception as e:
+                    logger.debug(f"MediaMTX API: {e}")
                 await asyncio.sleep(2)
         return False
 
     async def _handle_webrtc_offer(self, offer_data):
-        ice_servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
-        
+        """
+        Handshake WebRTC completo na ordem correcta:
+        1. Verificar stream RTSP
+        2. Criar PeerConnection
+        3. Adicionar track de vídeo
+        4. setRemoteDescription(offer)   ← obrigatório ANTES de createAnswer
+        5. Flush de candidatos pendentes
+        6. createAnswer + setLocalDescription
+        7. Publicar answer no Firestore
+        """
+        ice_servers = [
+            RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+            RTCIceServer(
+                urls=["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
+                username="openrelayproject",
+                credential="openrelayproject"
+            )
+        ]
+
+        # Reset de estado para nova sessão
+        self._remote_description_set = False
+        self._pending_candidates.clear()
+        self._processed_app_candidates.clear()
+
         if self.pc:
             await self.pc.close()
-
-        self.pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
-        self._remote_description_set = False
-
-        @self.pc.on("iceconnectionstatechange")
-        async def on_ice_connection_state():
-            if self.pc:
-                state = self.pc.iceConnectionState
-                logger.info(f"ICE Connection State: {state}")
-                if state in ["failed", "closed", "disconnected"]:
-                    await self._promote_next_controller()
-
-        @self.pc.on("icecandidate")
-        async def on_icecandidate(candidate):
-            if candidate:
-                self.doc_ref.update({
-                    'robot_candidates': firestore.ArrayUnion([{
-                        'candidate': candidate.candidate,
-                        'sdpMid': candidate.sdpMid,
-                        'sdpMLineIndex': candidate.sdpMLineIndex
-                    }])
-                })
-
-        @self.pc.on("datachannel")
-        def on_datachannel(channel):
-            @channel.on("message")
-            def on_message(message):
-                if self.current_controller:
-                    self.access_manager.update_activity(self.current_controller)
-                    try:
-                        cmd = json.loads(message)
-                        if self.robot:
-                            asyncio.run_coroutine_threadsafe(
-                                self.robot.execute_command(cmd.get('x', 0), cmd.get('y', 0), self.current_controller),
-                                self.loop
-                            )
-                    except Exception as e: logger.error(f"Erro comando: {e}")
+            self.pc = None
 
         try:
+            # 1. Verificar stream RTSP
             if not await self._wait_for_stream_ready():
-                raise Exception("RTSP Stream Offline")
+                logger.error("Abortando handshake: stream RTSP não disponível.")
+                return
 
-            player = MediaPlayer('rtsp://127.0.0.1:8554/robot', options={'rtsp_transport': 'tcp'})
-            
-            # Aguardar track de vídeo
+            # 2. Criar PeerConnection
+            self.pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+
+            @self.pc.on("iceconnectionstatechange")
+            async def on_ice_connection_state():
+                if self.pc:
+                    state = self.pc.iceConnectionState
+                    logger.info(f"ICE Connection State: {state}")
+                    if state in ["failed", "closed", "disconnected"]:
+                        await self._promote_next_controller()
+
+            @self.pc.on("icecandidate")
+            async def on_icecandidate(candidate):
+                if candidate:
+                    logger.debug(f"Candidato ICE do Robô: {candidate.candidate[:60]}...")
+                    self.doc_ref.update({
+                        'robot_candidates': firestore.ArrayUnion([{
+                            'candidate': candidate.candidate,
+                            'sdpMid': candidate.sdpMid,
+                            'sdpMLineIndex': candidate.sdpMLineIndex
+                        }])
+                    })
+
+            @self.pc.on("datachannel")
+            def on_datachannel(channel):
+                logger.info(f"DataChannel '{channel.label}' estabelecido!")
+
+                @channel.on("message")
+                def on_message(message):
+                    if self.current_controller:
+                        self.access_manager.update_activity(self.current_controller)
+                    try:
+                        # 2. Descodifica o comando JSON vindo da App
+                        cmd = json.loads(message)
+                        x = cmd.get('x', 0)
+                        y = cmd.get('y', 0)
+
+                        logger.info(f"🕹️ Comando de {self.current_controller}: X={x}, Y={y}")
+
+                        if self.robot:
+                            asyncio.run_coroutine_threadsafe(
+                                self.robot.execute_command(x, y, self.current_controller),
+                                self.loop
+                            )
+                    except Exception as e:
+                        logger.error(f"Erro ao processar mensagem do DataChannel: {e}")
+
+            # 3. Adicionar track de vídeo
+            options = {
+                'rtsp_transport': 'tcp',
+                'fflags': 'nobuffer+discardcorrupt',
+                'flags': 'low_delay',
+                'stimeout': '5000000',
+            }
+            player = MediaPlayer('rtsp://127.0.0.1:8554/robot', options=options)
+
+            video_track = None
             for _ in range(10):
-                if player.video: break
+                if player.video is not None:
+                    video_track = player.video
+                    break
                 await asyncio.sleep(0.5)
 
-            if player.video:
-                self.pc.addTrack(player.video)
-                logger.info("✓ Track de vídeo adicionada.")
-
-            offer = RTCSessionDescription(offer_data['sdp'], offer_data['type'])
-            await self.pc.setRemoteDescription(offer)
-            self._remote_description_set = True
+            if video_track is None:
+                logger.error("MediaPlayer não expôs track de vídeo. Abortando.")
+                return
             
-            answer = await self.pc.createAnswer()
-            await self.pc.setLocalDescription(answer)
+            self.pc.addTrack(video_track)
 
+            await self.pc.setRemoteDescription(
+                RTCSessionDescription(sdp=offer_data['sdp'], type=offer_data['type'])
+            )
+            self._remote_description_set = True           
+            
+            # 5. Processar candidatos ICE que chegaram enquanto esperávamos
             await self._flush_pending_candidates()
 
+            # 6. Criar Answer
+            answer = await self.pc.createAnswer()
+            await self.pc.setLocalDescription(answer)
+            logger.info("✓ Local description (answer) criada.")
+
+            # 7. Publicar Answer no Firestore
             self.doc_ref.update({
-                'webrtc_session.answer': {'sdp': self.pc.localDescription.sdp, 'type': self.pc.localDescription.type}
+                'webrtc_session.answer': {
+                    'sdp': self.pc.localDescription.sdp,
+                    'type': self.pc.localDescription.type
+                }
             })
-            logger.info("✓ Handshake WebRTC concluído com sucesso.")
+            logger.info("✓ Answer publicada no Firestore. Aguardando ICE...")
 
         except Exception as e:
-            logger.error(f"Erro na negociação SDP: {e}")
-            # Se falhar, limpamos tudo para a próxima tentativa
-            if self.pc:
-                await self.pc.close()
-                self.pc = None
+            logger.error(f"Erro fatal no Handshake WebRTC: {e}", exc_info=True)
         finally:
             self._handling_offer = False
 
     async def _add_ice_candidate(self, c):
-        if not self.pc or not self._remote_description_set: return
+        """Injeta candidatos ICE da App no PeerConnection do Robô."""
+        if not self.pc or not self._remote_description_set:
+            return
         try:
             from aiortc.sdp import candidate_from_sdp
-            parsed = candidate_from_sdp(c['candidate'].replace("candidate:", ""))
-            parsed.sdpMid, parsed.sdpMLineIndex = c['sdpMid'], c['sdpMLineIndex']
+            candidate_str = str(c.get('candidate', ''))
+            if not candidate_str:
+                return
+            parsed = candidate_from_sdp(candidate_str.replace("candidate:", ""))
+            parsed.sdpMid = str(c.get('sdpMid', '0'))
+            parsed.sdpMLineIndex = int(c.get('sdpMLineIndex', 0))
             await self.pc.addIceCandidate(parsed)
-        except Exception as e: logger.warning(f"ICE Ignorado: {e}")
+            logger.debug(f"✓ Candidato ICE da App injetado: {candidate_str[:60]}...")
+        except Exception as e:
+            logger.warning(f"Candidato ICE ignorado: {e}")
 
     async def _flush_pending_candidates(self):
+        """Injeta candidatos que chegaram antes do setRemoteDescription."""
+        if not self._pending_candidates:
+            return
+        logger.info(f"A processar {len(self._pending_candidates)} candidatos em fila...")
         for cand in self._pending_candidates:
             await self._add_ice_candidate(cand)
         self._pending_candidates.clear()
 
-    async def save_telemetry(self, data: Dict[str, Any]):
-        if self.initialized:
-            self.doc_ref.set({'telemetry': data, 'status.last_update': firestore.SERVER_TIMESTAMP}, merge=True)
+    async def save_telemetry(self, data: Dict[str, Any], save_history: bool = False): 
+        if not self.initialized:
+            return
+        try:
+            self.doc_ref.set(
+                {'telemetry': data},
+                merge=True
+            )
+
+            if save_history:
+                logger.info("Tentando gravar histórico...")
+                self.doc_ref.collection('telemetry_history').add({
+                    **data
+                })
+                logger.info("✅ Histórico gravado com sucesso!")
+
+        except Exception as e:
+            logger.error(f"Erro ao gravar telemetria: {e}")
+
+    def start_listening(self):
+        """Inicia a escuta de comandos. Só deve ser chamado quando o vídeo estiver OK."""
+        if not self._snapshot_listener:
+            logger.info("👂 Robô agora está a ouvir pedidos de conexão (Signaling ativo).")
+            self._start_firestore_listener()
+            asyncio.run_coroutine_threadsafe(self._control_timeout_loop(), self.loop)
+            # Atualiza o Firestore para dizer às Apps que já podem enviar Offers
+            self.doc_ref.update({'status.video_ready': True})
 
     async def disconnect(self):
-        if self._snapshot_listener: self._snapshot_listener.unsubscribe()
-        if self.pc: await self.pc.close()
+        """Fecha todas as conexões de forma limpa."""
+        logger.info("Encerrando Firebase Manager...")
+        if self._snapshot_listener:
+            self._snapshot_listener.unsubscribe()
+        if self.pc:
+            await self.pc.close()
         if self.initialized:
-            self.doc_ref.update({'status.online': False, 'webrtc_session': None})
+            self.doc_ref.update({
+                'status.online': False,
+                'status.video_ready': False, # IMPORTANTE
+                'webrtc_session': None
+            })
+
+    async def acquire_control_lock(self, user_email: str):
+        self.doc_ref.update({
+            'control.current_controller': user_email,
+            'control.lock_time': firestore.SERVER_TIMESTAMP
+        })
+
+    async def release_control_lock(self):
+        self.doc_ref.update({
+            'control.current_controller': None,
+            'control.lock_time': None
+        })
+
+    async def health_check(self) -> Dict[str, Any]:
+        try:
+            doc = self.doc_ref.get()
+            return {
+                "connected": doc.exists,
+                "timestamp": datetime.now().isoformat(),
+                "webrtc_active": self.pc is not None and self.pc.iceConnectionState == "completed"
+            }
+        except Exception as e:
+            return {"connected": False, "error": str(e)}

@@ -41,10 +41,7 @@ class RobotTelemetry:
     # Status do robo
     robot_moving: bool
     robot_rotation_direction: str  # "CW", "CCW", "NONE"
-    active_controller_email: Optional[str]
     
-    # Clientes de video
-    video_client_count: int
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -64,7 +61,6 @@ class TelemetryService:
         self.robot_moving = False
         self.robot_rotation = "NONE"
         self.active_controller = None
-        self.video_client_count = 0
         
         # Callback para o firmware.py enviar para o Firebase
         self.on_telemetry_update: Optional[Callable[[RobotTelemetry], None]] = None
@@ -107,30 +103,34 @@ class TelemetryService:
             self.active_controller = controller_email
 
     async def _collection_loop(self):
-        """Loop principal de telemetria."""
+        """Loop principal de telemetria com dois ritmos distintos."""
         last_firebase_save = datetime.now()
-        
+
         while True:
             try:
-                # 1. Recolher dados atuais
                 telemetry = await self._collect_telemetry()
                 self.latest_telemetry = telemetry
-                
-                # 2. Gerir histórico local (limite de 1000 entradas)
+
+                # Histórico local em RAM (limite 1000)
                 self.telemetry_history.append(telemetry)
                 if len(self.telemetry_history) > 1000:
                     self.telemetry_history.pop(0)
-                
-                # 3. Notificar o firmware para enviar para o Firebase/Websocket
+
+                now = datetime.now()
+                elapsed = (now - last_firebase_save).total_seconds()
+
                 if self.on_telemetry_update:
-                    self.on_telemetry_update(telemetry)
-                
-                # 4. Log de debug se ativo
+                    # Sempre notifica para atualizar estado atual (rápido)
+                    self.on_telemetry_update(telemetry, save_history=elapsed >= self.firebase_save_interval)
+
+                if elapsed >= self.firebase_save_interval:
+                    last_firebase_save = now
+
                 if config.DEBUG_MODE:
-                    logger.debug(f"Telemetry updated: Bat={telemetry.battery_voltage}V, GPS={telemetry.gps_is_valid}")
-                
+                    logger.debug(f"Telemetry: Bat={telemetry.battery_voltage}V | history_save={'YES' if elapsed >= self.firebase_save_interval else 'no'}")
+
                 await asyncio.sleep(self.collection_interval)
-                
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -171,10 +171,7 @@ class TelemetryService:
                 # Status
                 robot_moving=self.robot_moving,
                 robot_rotation_direction=self.robot_rotation,
-                active_controller_email=self.active_controller,
                 
-                # Video
-                video_client_count=self.video_client_count,
             )
             
         except Exception as e:
@@ -190,25 +187,8 @@ class TelemetryService:
             battery_voltage=0, battery_percentage=0, battery_current=0,
             battery_is_charging=False, battery_temperature=0,
             gps_latitude=0, gps_longitude=0, gps_altitude=0, gps_is_valid=False,
-            robot_moving=False, robot_rotation_direction="NONE",
-            active_controller_email=self.active_controller,
-            video_client_count=self.video_client_count
+            robot_moving=False, robot_rotation_direction="NONE"
         )
-
-    def get_telemetry_summary(self) -> Dict[str, Any]:
-        """Versão formatada para logs humanos ou display simples."""
-        if not self.latest_telemetry:
-            return {"status": "No data"}
-        
-        t = self.latest_telemetry
-        return {
-            "time": t.timestamp.split("T")[1][:8],
-            "bat": f"{t.battery_percentage}% ({t.battery_voltage}V)",
-            "cpu": f"{t.system_cpu}%",
-            "gps": "FIX" if t.gps_is_valid else "NO_FIX",
-            "moving": t.robot_moving,
-            "clients": t.video_client_count
-        }
 
     async def health_check(self) -> Dict[str, Any]:
         """Diagnóstico do serviço."""

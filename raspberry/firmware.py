@@ -54,6 +54,8 @@ class RobotFirmware:
         if not await self.video_manager.start():
             logger.error("Falha Crítica: Falha ao iniciar o streaming da câmara.")
             return False
+        
+        self.firebase_manager.start_listening()
 
         # 5. Inicializar Serviço de Telemetria
         self.telemetry_service = TelemetryService(self.system_monitor, self.serial_handler)
@@ -104,9 +106,11 @@ class RobotFirmware:
 
         await self.serial_handler.send_move_command(v_left, v_right)
 
-    def _on_telemetry_update(self, telemetry):
+    def _on_telemetry_update(self, telemetry, save_history: bool = False):
         """Envia os dados recolhidos para o Firestore."""
-        asyncio.create_task(self.firebase_manager.save_telemetry(telemetry.to_dict()))
+        asyncio.create_task(
+            self.firebase_manager.save_telemetry(telemetry.to_dict(), save_history=save_history)
+        )
 
     async def run(self):
         """Loop principal de execução."""
