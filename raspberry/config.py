@@ -17,8 +17,8 @@ ROBOT_NAME = os.getenv("ROBOT_NAME", "Robot Agromotion")
 # ============================================================================
 # RASPBERRY PI HARDWARE
 # ============================================================================
-PI_CAMERA_WIDTH = 1280
-PI_CAMERA_HEIGHT = 720
+PI_CAMERA_WIDTH = 640
+PI_CAMERA_HEIGHT = 480
 PI_CAMERA_FPS = 30
 
 # Temperature sensor (BCM2835 on-chip)
@@ -27,7 +27,7 @@ TEMPERATURE_SENSOR_PATH = "/sys/class/thermal/thermal_zone0/temp"
 # ============================================================================
 # ARDUINO / SERIAL COMMUNICATION
 # ============================================================================
-ARDUINO_SERIAL_PORT = os.getenv("ARDUINO_SERIAL_PORT", "/dev/ttyUSB0")
+ARDUINO_SERIAL_PORT = os.getenv("ARDUINO_SERIAL_PORT", "/dev/ttyACM0")
 ARDUINO_BAUD_RATE = 115200
 
 # Message protocols to Arduino
@@ -75,7 +75,7 @@ MOVEMENT_DEADZONE = 0.1  # Ignore values below 10%
 # Optimized for lower CPU usage
 TELEMETRY_BROADCAST_INTERVAL = 2 # seconds (0.5 Hz) - Reduced from 0.5s
 TELEMETRY_FIREBASE_INTERVAL = 10.0  # Save to Firebase every 10 seconds - Reduced from 5s
-
+TELEMETRY_HISTORY_INTERVAL = 600.0 # 10 minutos
 # ============================================================================
 # CONTROL LOCKING
 # ============================================================================

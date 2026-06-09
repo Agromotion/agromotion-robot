@@ -90,7 +90,7 @@ class SerialHandler:
         try:
             json_str = json.dumps(command) + "\n"
             self.serial_connection.write(json_str.encode())
-            logger.debug(f"→ Sent: {json_str.strip()}")
+            logger.info(f"→ Sent: {json_str.strip()}")
             return True
         except Exception as e:
             logger.error(f"✗ Failed to send command: {e}")
@@ -121,6 +121,8 @@ class SerialHandler:
                 break
 
     async def _process_message(self, message: str):
+        if not message or not message.startswith('{'):
+            return
         try:
             data = json.loads(message)
             msg_type = data.get("type", "").upper()
@@ -169,6 +171,9 @@ class SerialHandler:
             elif msg_type == "ERROR":
                 if self.on_error_received: self.on_error_received(data.get("error"))
 
+        except json.JSONDecodeError:
+                # Silencia o erro se não for um JSON completo (evita spam no log)
+            logger.debug(f"Ignorada linha não-JSON: {message}")
         except Exception as e:
             logger.error(f"Error processing message: {e}")
 

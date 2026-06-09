@@ -200,9 +200,7 @@ install_mediamtx() {
         *) error "Unsupported architecture: $ARCH"; return 1 ;;
     esac
 
-    # Descobre a última release do mediamtx
-    LATEST_TAG=$(curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest | grep -Po '"tag_name": "\K.*?(?=")')
-    URL="https://github.com/bluenviron/mediamtx/releases/download/${LATEST_TAG}/mediamtx_${LATEST_TAG}_linux_${M_ARCH}.tar.gz"
+    URL="https://github.com/bluenviron/mediamtx/releases/download/v1.4.2/mediamtx_v1.4.2_linux_$M_ARCH.tar.gz"
 
     log "Downloading Mediamtx for $ARCH..."
     cd /tmp

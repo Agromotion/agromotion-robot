@@ -63,7 +63,7 @@ class FirebaseManager:
             })
 
             self.notification_service = NotificationService(self.db, self.robot_id)
-            
+
             asyncio.run_coroutine_threadsafe(self._control_timeout_loop(), self.loop)
 
             self.connected = True
@@ -82,52 +82,78 @@ class FirebaseManager:
                 if not data:
                     continue
 
-                # 1. TRATAMENTO DE HANDSHAKE (OFFER)
-                session = data.get('webrtc_session')
                 control_data = data.get('control', {})
                 app_email = control_data.get('last_handshake_email')
+                session = data.get('webrtc_session')
 
+                # 1. TRATAMENTO DE HANDSHAKE (OFFER)
                 if session and session.get('offer') and not session.get('answer'):
+                    if self.pc and self.pc.iceConnectionState in ["checking", "connected", "completed"]:
+                        logger.warning("🚫 Ignorando nova offer - handshake em progresso")
+                        continue
+
                     if not self._handling_offer:
                         self._handling_offer = True
                         if app_email:
+                            logger.info(f"⚙️ Solicitando controlo e bloqueando timeout para: {app_email}")
                             self.access_manager.request_control(app_email)
+                            self.access_manager.update_activity(app_email)  # Evita timeout imediato
                             self.current_controller = self.access_manager.current_controller
                             self._sync_control_state()
-                            self._handling_offer = True
+                        
                         logger.info(f"📡 Oferta WebRTC de {app_email}. Iniciando conexão...")
                         asyncio.run_coroutine_threadsafe(
                             self._handle_webrtc_offer(session['offer']),
                             self.loop
                         )
+                        continue  # ✨ Alterado de return para continue (Corrige o crash de inicialização)
 
-                # 2. CANDIDATOS ICE
+                # 2. PROTEÇÃO DE SESSÃO ATIVA 
+                if self.pc and self.pc.iceConnectionState in ["checking", "completed", "connected"]:
+                    if not app_email or app_email == 'unknown':
+                        logger.debug("Snapshot de limpeza ignorado para proteger Handshake ativo.")
+                        continue
+
+                # 3. CANDIDATOS ICE
                 app_candidates = data.get('app_candidates', [])
-                if app_candidates:
+                if app_candidates and self.pc:
                     for cand_data in app_candidates:
                         cand_str = cand_data.get('candidate')
                         if cand_str and cand_str not in self._processed_app_candidates:
                             self._processed_app_candidates.add(cand_str)
-                            if self.pc and self._remote_description_set:
+                            if self._remote_description_set:
                                 asyncio.run_coroutine_threadsafe(
                                     self._add_ice_candidate(cand_data),
                                     self.loop
                                 )
                             else:
-                                logger.debug("Candidato ICE em fila (remote description ainda não definida).")
                                 self._pending_candidates.append(cand_data)
 
         self._snapshot_listener = self.doc_ref.on_snapshot(on_snapshot)
 
     async def _control_timeout_loop(self):
-        """Verifica periodicamente se o controlador atual expirou."""
-        while True:
-            await asyncio.sleep(5)
-            if self.current_controller:
-                status = self.access_manager.get_control_status()
-                if not status['is_controlled']:
-                    logger.warning(f"Timeout: {self.current_controller} perdeu o controlo.")
-                    await self._promote_next_controller()
+            """Verifica periodicamente se o controlador atual expirou."""
+            while True:
+                await asyncio.sleep(2)
+                if self.current_controller:
+                    # 🛑 SÓ verifica inatividade se a ligação NÃO estiver em negociação/handshake
+                    if self.pc and self.pc.iceConnectionState in ["checking"]:
+                        self.access_manager.update_activity(self.current_controller)
+                        continue
+
+                    # Se a ligação falhou ou está ligada mas o joystick parou de enviar dados há > 7s
+                    if self.access_manager.is_inactive(timeout_seconds=20):
+                        logger.warning(f"Detetada perda de sinal de {self.current_controller}. A libertar...")
+                        if self.pc:
+                            try:
+                                self.pc.on("iceconnectionstatechange", None)
+                                self.pc.on("icecandidate", None)
+                                self.pc.on("datachannel", None)
+                                await self.pc.close()
+                            except Exception:
+                                pass
+                            self.pc = None
+                        await self._promote_next_controller()
 
     async def _promote_next_controller(self):
         """Liberta o controlo atual e passa para o próximo na fila."""
@@ -176,33 +202,46 @@ class FirebaseManager:
         return False
 
     async def _handle_webrtc_offer(self, offer_data):
-        """
-        Handshake WebRTC completo na ordem correcta:
-        1. Verificar stream RTSP
-        2. Criar PeerConnection
-        3. Adicionar track de vídeo
-        4. setRemoteDescription(offer)   ← obrigatório ANTES de createAnswer
-        5. Flush de candidatos pendentes
-        6. createAnswer + setLocalDescription
-        7. Publicar answer no Firestore
-        """
         ice_servers = [
-            RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-            RTCIceServer(
-                urls=["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
-                username="openrelayproject",
-                credential="openrelayproject"
-            )
-        ]
+        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+        RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
+
+        # OpenRelay STUN
+        RTCIceServer(urls=["stun:openrelay.metered.ca:80"]),
+
+        # OpenRelay TURN (TCP + UDP fallback)
+        RTCIceServer(
+            urls=[
+                "turn:openrelay.metered.ca:80",
+                "turn:openrelay.metered.ca:443",
+                "turn:openrelay.metered.ca:443?transport=tcp"
+            ],
+            username="openrelayproject",
+            credential="openrelayproject"
+        )
+    ]
 
         # Reset de estado para nova sessão
         self._remote_description_set = False
         self._pending_candidates.clear()
         self._processed_app_candidates.clear()
 
+        # FECHO SEGURO: Evita o crash de AttributeError / 'NoneType' object has no attribute 'sendto'
         if self.pc:
-            await self.pc.close()
-            self.pc = None
+            logger.info("Fechando conexão WebRTC anterior de forma segura...")
+            try:
+                # Remove os handlers para que nenhum evento tente disparar durante o fecho
+                self.pc.on("iceconnectionstatechange", None)
+                self.pc.on("icecandidate", None)
+                self.pc.on("datachannel", None)
+                
+                await self.pc.close()
+            except Exception as e:
+                logger.debug(f"Erro esperado ao fechar PC: {e}")
+            finally:
+                self.pc = None
+                # Pequena pausa para deixar o loop do asyncio processar os cancelamentos do aioice
+                await asyncio.sleep(0.2) 
 
         try:
             # 1. Verificar stream RTSP
@@ -241,22 +280,31 @@ class FirebaseManager:
                 def on_message(message):
                     if self.current_controller:
                         self.access_manager.update_activity(self.current_controller)
+
                     try:
-                        # 2. Descodifica o comando JSON vindo da App
                         cmd = json.loads(message)
-                        x = cmd.get('x', 0)
-                        y = cmd.get('y', 0)
 
-                        logger.info(f"🕹️ Comando de {self.current_controller}: X={x}, Y={y}")
+                        x = cmd.get('x', None)
+                        y = cmd.get('y', None)
+                        drum = cmd.get('drum', None)
 
+                        # 🚀 ENVIO "FIRE-AND-FORGET" PARA O ROBOT OBJECT
                         if self.robot:
-                            asyncio.run_coroutine_threadsafe(
-                                self.robot.execute_command(x, y, self.current_controller),
-                                self.loop
-                            )
+                            if drum is not None:
+                                # NÃO executar diretamente (evita concorrência)
+                                asyncio.run_coroutine_threadsafe(
+                                    self.robot.execute_drum(drum, self.current_controller),
+                                    self.loop
+                                )
+
+                            elif x is not None and y is not None:
+                                asyncio.run_coroutine_threadsafe(
+                                    self.robot.execute_command(x, y, self.current_controller),
+                                    self.loop
+                                )
+
                     except Exception as e:
                         logger.error(f"Erro ao processar mensagem do DataChannel: {e}")
-
             # 3. Adicionar track de vídeo
             options = {
                 'rtsp_transport': 'tcp',
@@ -276,14 +324,14 @@ class FirebaseManager:
             if video_track is None:
                 logger.error("MediaPlayer não expôs track de vídeo. Abortando.")
                 return
-            
+
             self.pc.addTrack(video_track)
 
             await self.pc.setRemoteDescription(
                 RTCSessionDescription(sdp=offer_data['sdp'], type=offer_data['type'])
             )
-            self._remote_description_set = True           
-            
+            self._remote_description_set = True
+
             # 5. Processar candidatos ICE que chegaram enquanto esperávamos
             await self._flush_pending_candidates()
 
@@ -332,7 +380,7 @@ class FirebaseManager:
             await self._add_ice_candidate(cand)
         self._pending_candidates.clear()
 
-    async def save_telemetry(self, data: Dict[str, Any], save_history: bool = False): 
+    async def save_telemetry(self, data: Dict[str, Any], save_history: bool = False):
         if not self.initialized:
             return
         try:

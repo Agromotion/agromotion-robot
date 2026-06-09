@@ -1,25 +1,33 @@
-# Mediamtx Configuration for AgroMotion Robot
-# Simplified config compatible with latest mediamtx versions
+# Configuração AgroMotion para MediaMTX v1.17.1
 
-# Logging
-logLevel: info
+# --- API ---
+api: yes
+apiAddress: :9997
 
-# RTSP Server (input from FFmpeg/libcamera)
+# --- RTSP ---
 rtsp: yes
-rtspAddress: "0.0.0.0:8554"
+rtspAddress: :8554
 
-# WebRTC Server (output to browsers)
+# --- HLS ---
+hls: yes
+hlsAddress: :8888
+
+# --- WebRTC ---
 webrtc: yes
-webrtcAddress: "0.0.0.0:8555"
+webrtcAddress: :8889
 
-# Disable unused protocols
-rtmp: no
-hls: no
-srt: no
+protocols: [udp, multicast, tcp]
 
-# Path configuration
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+  - url: turn:openrelay.metered.ca:80
+    username: openrelayproject
+    password: openrelayproject
+  - url: turn:openrelay.metered.ca:443
+    username: openrelayproject
+    password: openrelayproject
+
+# --- Paths ---
 paths:
   robot:
-    # Accept RTSP input and serve via WebRTC
-    sourceProtocol: tcp
-
+    source: publisher

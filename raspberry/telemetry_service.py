@@ -19,29 +19,29 @@ logger = logging.getLogger(__name__)
 class RobotTelemetry:
     """Dados telemétricos do robô"""
     timestamp: str
-    
+
     # Sistema (dados do próprio Raspberry Pi)
     system_cpu: float
     system_ram: float
     system_temperature: float
-    
+
     # Bateria
     battery_voltage: float
     battery_percentage: float
     battery_current: float
     battery_is_charging: bool
     battery_temperature: float
-    
+
     # GPS
     gps_latitude: float
     gps_longitude: float
     gps_altitude: float
     gps_is_valid: bool
-    
+
     # Status do robo
     robot_moving: bool
     robot_rotation_direction: str  # "CW", "CCW", "NONE"
-    
+
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -55,19 +55,19 @@ class TelemetryService:
     ):
         self.system_monitor = system_monitor
         self.serial_handler = serial_handler
-        
+
         # Estado atual
         self.latest_telemetry: Optional[RobotTelemetry] = None
         self.robot_moving = False
         self.robot_rotation = "NONE"
         self.active_controller = None
-        
+
         # Callback para o firmware.py enviar para o Firebase
         self.on_telemetry_update: Optional[Callable[[RobotTelemetry], None]] = None
-        
+
         self.collection_interval = config.TELEMETRY_BROADCAST_INTERVAL
         self.firebase_save_interval = config.TELEMETRY_FIREBASE_INTERVAL
-        
+
         self.collection_task: Optional[asyncio.Task] = None
         self.telemetry_history: List[RobotTelemetry] = []
 
@@ -103,32 +103,46 @@ class TelemetryService:
             self.active_controller = controller_email
 
     async def _collection_loop(self):
-        """Loop principal de telemetria com dois ritmos distintos."""
-        last_firebase_save = datetime.now()
+        """Loop principal de telemetria com três ritmos: local, live e histórico."""
+        last_firebase_live = datetime.now()
+        last_history_save = datetime.now()
 
         while True:
             try:
                 telemetry = await self._collect_telemetry()
                 self.latest_telemetry = telemetry
 
-                # Histórico local em RAM (limite 1000)
+                # Histórico local em RAM (mantém os últimos 1000 registos)
                 self.telemetry_history.append(telemetry)
                 if len(self.telemetry_history) > 1000:
                     self.telemetry_history.pop(0)
 
                 now = datetime.now()
-                elapsed = (now - last_firebase_save).total_seconds()
 
-                if self.on_telemetry_update:
-                    # Sempre notifica para atualizar estado atual (rápido)
-                    self.on_telemetry_update(telemetry, save_history=elapsed >= self.firebase_save_interval)
+                # 1. Verificar se é hora de atualizar o STATUS ATUAL (Live)
+                elapsed_live = (now - last_firebase_live).total_seconds()
 
-                if elapsed >= self.firebase_save_interval:
-                    last_firebase_save = now
+                # 2. Verificar se é hora de gravar no HISTÓRICO ( Snapshot)
+                elapsed_history = (now - last_history_save).total_seconds()
+
+                save_history_flag = False
+                if elapsed_history >= config.TELEMETRY_HISTORY_INTERVAL:
+                    save_history_flag = True
+                    last_history_save = now
+                    logger.info("🕒 Intervalo de histórico atingido (10 min).")
+
+                # Se atingiu o intervalo de 10 segundos, envia para o Firebase
+                if elapsed_live >= self.firebase_save_interval:
+                    if self.on_telemetry_update:
+                        # Envia os dados e a flag indicando se deve criar novo documento no histórico
+                        self.on_telemetry_update(telemetry, save_history=save_history_flag)
+
+                    last_firebase_live = now
 
                 if config.DEBUG_MODE:
-                    logger.debug(f"Telemetry: Bat={telemetry.battery_voltage}V | history_save={'YES' if elapsed >= self.firebase_save_interval else 'no'}")
+                    logger.debug(f"Telemetry: V={telemetry.battery_voltage} | SaveHistory={save_history_flag}")
 
+                # O loop "acorda" no ritmo do Broadcast Interval (2s)
                 await asyncio.sleep(self.collection_interval)
 
             except asyncio.CancelledError:
@@ -142,38 +156,38 @@ class TelemetryService:
         try:
             # Dados do Sistema (Pi)
             sys_metrics = await self.system_monitor.get_metrics()
-            
+
             # Dados do Arduino (Seguro contra falhas de conexão)
             gps = self.serial_handler.get_latest_gps()
             battery = self.serial_handler.get_latest_battery()
-            
+
             return RobotTelemetry(
                 timestamp=datetime.now().isoformat(),
-                
+
                 # System
                 system_cpu=sys_metrics.cpu_percent,
                 system_ram=sys_metrics.ram_percent,
                 system_temperature=sys_metrics.temperature_celsius,
-                
+
                 # Battery
                 battery_voltage=round(battery.voltage, 2),
                 battery_percentage=round(battery.percentage, 1),
                 battery_current=round(battery.current, 2),
                 battery_is_charging=battery.is_charging,
                 battery_temperature=round(battery.temperature, 1),
-                
+
                 # GPS
                 gps_latitude=gps.latitude,
                 gps_longitude=gps.longitude,
                 gps_altitude=gps.altitude,
                 gps_is_valid=gps.is_valid,
-                
+
                 # Status
                 robot_moving=self.robot_moving,
                 robot_rotation_direction=self.robot_rotation,
-                
+
             )
-            
+
         except Exception as e:
             logger.error(f"Falha ao recolher telemetria: {e}")
             # Fallback em caso de erro para não quebrar a App
