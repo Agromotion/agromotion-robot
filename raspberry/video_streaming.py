@@ -36,7 +36,7 @@ class VideoStreamingManager:
 
             # 2. Esperar que o Mediamtx esteja pronto para receber o stream
             # Essencial para evitar o erro "failed to open output"
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
             # 3. Iniciar o pipeline de vídeo estabilizado
             if not await self._start_video_pipeline():

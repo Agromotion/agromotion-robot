@@ -2,16 +2,14 @@ import logging
 import asyncio
 import json
 from typing import Dict, Any, Optional, Callable
-from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
-from aiortc.contrib.media import MediaPlayer
-from notification_service import NotificationService
-from control_access_manager import ControlAccessManager
-import aiohttp
 
 import config
+from notification_service import NotificationService
+from control_access_manager import ControlAccessManager
+from schedule_manager import ScheduleManager
+from webrtc_manager import WebRTCManager
 
 logger = logging.getLogger(__name__)
 
@@ -23,21 +21,23 @@ class FirebaseManager:
         self.doc_ref = None
         self.robot = robot_instance
         self.notification_service = None
-        self._handling_offer = False
+        
+        self.on_auto_mode_change: Optional[Callable[[bool, bool], None]] = None
+        self._last_auto_mode_state: Optional[bool] = None
 
         # Gestão de Acesso e Fila
         self.access_manager = ControlAccessManager()
         self.current_controller = None
+        
+        # Sub-Managers de domínio
+        self.schedule_manager: Optional[ScheduleManager] = None
+        self.webrtc_manager: Optional[WebRTCManager] = None
 
-        # WebRTC
-        self.pc: Optional[RTCPeerConnection] = None
         self.loop = asyncio.get_event_loop()
         self.on_control_change: Optional[Callable] = None
         self.connected = False
         self._snapshot_listener = None
-        self._processed_app_candidates = set()
-        self._pending_candidates = []
-        self._remote_description_set = False
+        self._timeout_task = None
 
     def initialize(self) -> bool:
         """Inicializa a ligação ao Firebase e limpa estados residuais."""
@@ -64,7 +64,12 @@ class FirebaseManager:
 
             self.notification_service = NotificationService(self.db, self.robot_id)
 
-            asyncio.run_coroutine_threadsafe(self._control_timeout_loop(), self.loop)
+            self.schedule_manager = ScheduleManager(self.doc_ref, self.notification_service, self.loop)
+            self.webrtc_manager = WebRTCManager(self.doc_ref, self.loop, self.access_manager, self.robot)
+            self.webrtc_manager.on_disconnect = self._promote_next_controller
+
+            self._timeout_task = asyncio.run_coroutine_threadsafe(self._control_timeout_loop(), self.loop)
+            self.schedule_manager.start()
 
             self.connected = True
             self.initialized = True
@@ -85,15 +90,19 @@ class FirebaseManager:
                 control_data = data.get('control', {})
                 app_email = control_data.get('last_handshake_email')
                 session = data.get('webrtc_session')
+                status_data = data.get('status', {})
+
+                auto_mode = status_data.get('autoMode')
+                if isinstance(auto_mode, bool):
+                    self._handle_auto_mode_change(auto_mode)
 
                 # 1. TRATAMENTO DE HANDSHAKE (OFFER)
                 if session and session.get('offer') and not session.get('answer'):
-                    if self.pc and self.pc.iceConnectionState in ["checking", "connected", "completed"]:
+                    if self.webrtc_manager.pc and self.webrtc_manager.pc.iceConnectionState in ["checking", "connected", "completed"]:
                         logger.warning("🚫 Ignorando nova offer - handshake em progresso")
                         continue
 
-                    if not self._handling_offer:
-                        self._handling_offer = True
+                    if not self.webrtc_manager.handling_offer:
                         if app_email:
                             logger.info(f"⚙️ Solicitando controlo e bloqueando timeout para: {app_email}")
                             self.access_manager.request_control(app_email)
@@ -106,7 +115,7 @@ class FirebaseManager:
                             self._handle_webrtc_offer(session['offer']),
                             self.loop
                         )
-                        continue  # ✨ Alterado de return para continue (Corrige o crash de inicialização)
+                        continue  # Alterado de return para continue (Corrige o crash de inicialização)
 
                 # 2. PROTEÇÃO DE SESSÃO ATIVA 
                 if self.pc and self.pc.iceConnectionState in ["checking", "completed", "connected"]:
@@ -136,7 +145,7 @@ class FirebaseManager:
             while True:
                 await asyncio.sleep(2)
                 if self.current_controller:
-                    # 🛑 SÓ verifica inatividade se a ligação NÃO estiver em negociação/handshake
+                    # SÓ verifica inatividade se a ligação NÃO estiver em negociação/handshake
                     if self.pc and self.pc.iceConnectionState in ["checking"]:
                         self.access_manager.update_activity(self.current_controller)
                         continue
@@ -154,6 +163,76 @@ class FirebaseManager:
                                 pass
                             self.pc = None
                         await self._promote_next_controller()
+
+    def _start_schedules_listener(self):
+        """Monitoriza a coleção schedules para carregar agendamentos ativos."""
+        def on_snapshot(col_snapshot, changes, read_time):
+            new_schedules = []
+            for doc in col_snapshot:
+                data = doc.to_dict()
+                if data and data.get('active'):
+                    data['id'] = doc.id
+                    new_schedules.append(data)
+            self.schedules = new_schedules
+            logger.info(f"📅 Agendamentos atualizados: {len(self.schedules)} ativos.")
+
+        schedules_ref = self.doc_ref.collection('schedules')
+        self._schedules_listener = schedules_ref.on_snapshot(on_snapshot)
+
+    async def _schedule_checker_loop(self):
+        """Verifica periodicamente se algum agendamento deve ser acionado."""
+        while True:
+            await asyncio.sleep(20) # Verifica a cada 20 segundos
+            if not self.initialized or not self.schedules:
+                continue
+
+            now = datetime.now()
+            current_time = now.strftime("%H:%M")
+            current_date = now.strftime("%Y-%m-%d")
+            weekday = now.weekday()
+
+            for sched in self.schedules:
+                sched_time = sched.get('time')
+                sched_days = sched.get('days', '')
+                sched_id = sched.get('id')
+
+                if sched_time == current_time:
+                    if self._is_day_match(sched_days, weekday):
+                        # Evita disparar repetidamente no mesmo minuto ou no mesmo dia
+                        if self._triggered_schedules.get(sched_id) != current_date:
+                            logger.info(f"⏰ Agendamento disparado: {sched_time} ({sched_days})")
+                            self._triggered_schedules[sched_id] = current_date
+                            
+                            # Ativa o modo automático no Firestore (propaga para todos os clientes e Hardware)
+                            try:
+                                self.doc_ref.update({'status.autoMode': True})
+                                if self.notification_service:
+                                    self.notification_service.broadcast_alert(
+                                        "Agendamento Ativado",
+                                        f"O modo automático iniciou conforme o agendamento das {sched_time}.",
+                                        "info"
+                                    )
+                            except Exception as e:
+                                logger.error(f"Erro ao ativar autoMode por agendamento: {e}")
+
+    def _is_day_match(self, days_str: str, weekday: int) -> bool:
+        if not days_str:
+            return False
+        
+        def clean_str(s):
+            # Remove acentos e converte para minúsculas
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn').lower()
+
+        clean_days = clean_str(days_str)
+        if "segunda a domingo" in clean_days or "todos os dias" in clean_days:
+            return True
+        if "dias uteis" in clean_days:
+            return weekday in [0, 1, 2, 3, 4]
+        if "fins de semana" in clean_days or "fim de semana" in clean_days:
+            return weekday in [5, 6]
+
+        pt_days = ["segunda", "terca", "quarta", "quinta", "sexta", "sabado", "domingo"]
+        return pt_days[weekday] in clean_days
 
     async def _promote_next_controller(self):
         """Liberta o controlo atual e passa para o próximo na fila."""
@@ -174,216 +253,40 @@ class FirebaseManager:
             'status.video_client_count': len(self.access_manager.control_queue) + (1 if self.access_manager.current_controller else 0)
         })
 
-    async def _wait_for_stream_ready(self, path="robot", timeout=20) -> bool:
-        """Verifica via API do MediaMTX se o stream está activo."""
-        url = "http://127.0.0.1:9997/v3/paths/list"
-        async with aiohttp.ClientSession() as session:
-            for i in range(timeout // 2):
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            for item in data.get("items", []):
-                                if item.get("name") == path:
-                                    # Compatibilidade com diferentes versões do MediaMTX
-                                    is_ready = (
-                                        item.get("ready") is True or
-                                        item.get("readyTime") is not None or
-                                        item.get("bytesReceived", 0) > 0 or
-                                        len(item.get("tracks", [])) > 0
-                                    )
-                                    if is_ready:
-                                        logger.info(f"✓ Stream '{path}' confirmado (tentativa {i+1})")
-                                        return True
-                                    logger.warning(f"Path '{path}' existe mas não está ready ainda.")
-                except Exception as e:
-                    logger.debug(f"MediaMTX API: {e}")
-                await asyncio.sleep(2)
-        return False
+    def _handle_auto_mode_change(self, enabled: bool, force: bool = False):
+        if not force and enabled == self._last_auto_mode_state:
+            return
 
-    async def _handle_webrtc_offer(self, offer_data):
-        ice_servers = [
-        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-        RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
+        self._last_auto_mode_state = enabled
+        logger.info(f"Modo automático atualizado: {'ON' if enabled else 'OFF'}")
 
-        # OpenRelay STUN
-        RTCIceServer(urls=["stun:openrelay.metered.ca:80"]),
-
-        # OpenRelay TURN (TCP + UDP fallback)
-        RTCIceServer(
-            urls=[
-                "turn:openrelay.metered.ca:80",
-                "turn:openrelay.metered.ca:443",
-                "turn:openrelay.metered.ca:443?transport=tcp"
-            ],
-            username="openrelayproject",
-            credential="openrelayproject"
-        )
-    ]
-
-        # Reset de estado para nova sessão
-        self._remote_description_set = False
-        self._pending_candidates.clear()
-        self._processed_app_candidates.clear()
-
-        # FECHO SEGURO: Evita o crash de AttributeError / 'NoneType' object has no attribute 'sendto'
-        if self.pc:
-            logger.info("Fechando conexão WebRTC anterior de forma segura...")
+        if self.on_auto_mode_change:
             try:
-                # Remove os handlers para que nenhum evento tente disparar durante o fecho
-                self.pc.on("iceconnectionstatechange", None)
-                self.pc.on("icecandidate", None)
-                self.pc.on("datachannel", None)
-                
-                await self.pc.close()
-            except Exception as e:
-                logger.debug(f"Erro esperado ao fechar PC: {e}")
-            finally:
-                self.pc = None
-                # Pequena pausa para deixar o loop do asyncio processar os cancelamentos do aioice
-                await asyncio.sleep(0.2) 
+                self.loop.call_soon_threadsafe(self.on_auto_mode_change, enabled, force)
+            except RuntimeError:
+                self.on_auto_mode_change(enabled, force)
 
+    def get_current_auto_mode(self) -> Optional[bool]:
         try:
-            # 1. Verificar stream RTSP
-            if not await self._wait_for_stream_ready():
-                logger.error("Abortando handshake: stream RTSP não disponível.")
-                return
+            snapshot = self.doc_ref.get()
+            if not snapshot.exists:
+                return None
 
-            # 2. Criar PeerConnection
-            self.pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
-
-            @self.pc.on("iceconnectionstatechange")
-            async def on_ice_connection_state():
-                if self.pc:
-                    state = self.pc.iceConnectionState
-                    logger.info(f"ICE Connection State: {state}")
-                    if state in ["failed", "closed", "disconnected"]:
-                        await self._promote_next_controller()
-
-            @self.pc.on("icecandidate")
-            async def on_icecandidate(candidate):
-                if candidate:
-                    logger.debug(f"Candidato ICE do Robô: {candidate.candidate[:60]}...")
-                    self.doc_ref.update({
-                        'robot_candidates': firestore.ArrayUnion([{
-                            'candidate': candidate.candidate,
-                            'sdpMid': candidate.sdpMid,
-                            'sdpMLineIndex': candidate.sdpMLineIndex
-                        }])
-                    })
-
-            @self.pc.on("datachannel")
-            def on_datachannel(channel):
-                logger.info(f"DataChannel '{channel.label}' estabelecido!")
-
-                @channel.on("message")
-                def on_message(message):
-                    if self.current_controller:
-                        self.access_manager.update_activity(self.current_controller)
-
-                    try:
-                        cmd = json.loads(message)
-
-                        x = cmd.get('x', None)
-                        y = cmd.get('y', None)
-                        drum = cmd.get('drum', None)
-
-                        # 🚀 ENVIO "FIRE-AND-FORGET" PARA O ROBOT OBJECT
-                        if self.robot:
-                            if drum is not None:
-                                # NÃO executar diretamente (evita concorrência)
-                                asyncio.run_coroutine_threadsafe(
-                                    self.robot.execute_drum(drum, self.current_controller),
-                                    self.loop
-                                )
-
-                            elif x is not None and y is not None:
-                                asyncio.run_coroutine_threadsafe(
-                                    self.robot.execute_command(x, y, self.current_controller),
-                                    self.loop
-                                )
-
-                    except Exception as e:
-                        logger.error(f"Erro ao processar mensagem do DataChannel: {e}")
-            # 3. Adicionar track de vídeo
-            options = {
-                'rtsp_transport': 'tcp',
-                'fflags': 'nobuffer+discardcorrupt',
-                'flags': 'low_delay',
-                'stimeout': '5000000',
-            }
-            player = MediaPlayer('rtsp://127.0.0.1:8554/robot', options=options)
-
-            video_track = None
-            for _ in range(10):
-                if player.video is not None:
-                    video_track = player.video
-                    break
-                await asyncio.sleep(0.5)
-
-            if video_track is None:
-                logger.error("MediaPlayer não expôs track de vídeo. Abortando.")
-                return
-
-            self.pc.addTrack(video_track)
-
-            await self.pc.setRemoteDescription(
-                RTCSessionDescription(sdp=offer_data['sdp'], type=offer_data['type'])
-            )
-            self._remote_description_set = True
-
-            # 5. Processar candidatos ICE que chegaram enquanto esperávamos
-            await self._flush_pending_candidates()
-
-            # 6. Criar Answer
-            answer = await self.pc.createAnswer()
-            await self.pc.setLocalDescription(answer)
-            logger.info("✓ Local description (answer) criada.")
-
-            # 7. Publicar Answer no Firestore
-            self.doc_ref.update({
-                'webrtc_session.answer': {
-                    'sdp': self.pc.localDescription.sdp,
-                    'type': self.pc.localDescription.type
-                }
-            })
-            logger.info("✓ Answer publicada no Firestore. Aguardando ICE...")
-
+            data = snapshot.to_dict() or {}
+            status_data = data.get('status', {})
+            auto_mode = status_data.get('autoMode')
+            return auto_mode if isinstance(auto_mode, bool) else None
         except Exception as e:
-            logger.error(f"Erro fatal no Handshake WebRTC: {e}", exc_info=True)
-        finally:
-            self._handling_offer = False
-
-    async def _add_ice_candidate(self, c):
-        """Injeta candidatos ICE da App no PeerConnection do Robô."""
-        if not self.pc or not self._remote_description_set:
-            return
-        try:
-            from aiortc.sdp import candidate_from_sdp
-            candidate_str = str(c.get('candidate', ''))
-            if not candidate_str:
-                return
-            parsed = candidate_from_sdp(candidate_str.replace("candidate:", ""))
-            parsed.sdpMid = str(c.get('sdpMid', '0'))
-            parsed.sdpMLineIndex = int(c.get('sdpMLineIndex', 0))
-            await self.pc.addIceCandidate(parsed)
-            logger.debug(f"✓ Candidato ICE da App injetado: {candidate_str[:60]}...")
-        except Exception as e:
-            logger.warning(f"Candidato ICE ignorado: {e}")
-
-    async def _flush_pending_candidates(self):
-        """Injeta candidatos que chegaram antes do setRemoteDescription."""
-        if not self._pending_candidates:
-            return
-        logger.info(f"A processar {len(self._pending_candidates)} candidatos em fila...")
-        for cand in self._pending_candidates:
-            await self._add_ice_candidate(cand)
-        self._pending_candidates.clear()
+            logger.debug(f"Não foi possível ler autoMode atual: {e}")
+            return None
 
     async def save_telemetry(self, data: Dict[str, Any], save_history: bool = False):
         if not self.initialized:
             return
         try:
+            # Substitui a timestamp local (do Pi) pela timestamp oficial da Google
+            data['timestamp'] = firestore.SERVER_TIMESTAMP
+
             self.doc_ref.set(
                 {'telemetry': data},
                 merge=True
@@ -404,7 +307,6 @@ class FirebaseManager:
         if not self._snapshot_listener:
             logger.info("👂 Robô agora está a ouvir pedidos de conexão (Signaling ativo).")
             self._start_firestore_listener()
-            asyncio.run_coroutine_threadsafe(self._control_timeout_loop(), self.loop)
             # Atualiza o Firestore para dizer às Apps que já podem enviar Offers
             self.doc_ref.update({'status.video_ready': True})
 
@@ -413,8 +315,14 @@ class FirebaseManager:
         logger.info("Encerrando Firebase Manager...")
         if self._snapshot_listener:
             self._snapshot_listener.unsubscribe()
-        if self.pc:
-            await self.pc.close()
+        if self._timeout_task:
+            self._timeout_task.cancel()
+            
+        if self.schedule_manager:
+            self.schedule_manager.stop()
+        if self.webrtc_manager:
+            await self.webrtc_manager.close()
+            
         if self.initialized:
             self.doc_ref.update({
                 'status.online': False,
@@ -439,8 +347,8 @@ class FirebaseManager:
             doc = self.doc_ref.get()
             return {
                 "connected": doc.exists,
-                "timestamp": datetime.now().isoformat(),
-                "webrtc_active": self.pc is not None and self.pc.iceConnectionState == "completed"
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "webrtc_active": self.webrtc_manager is not None and self.webrtc_manager.pc is not None and self.webrtc_manager.pc.iceConnectionState == "completed"
             }
         except Exception as e:
             return {"connected": False, "error": str(e)}

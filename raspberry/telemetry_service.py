@@ -1,6 +1,6 @@
 """
-Telemetry service - collects and broadcasts robot data
-Integrates system monitoring, GPS, battery, and control status
+Serviço de telemetria - recolhe e transmite dados do robô
+Integra monitorização de sistema, GPS, bateria e estado de controlo
 """
 
 import asyncio
@@ -37,6 +37,11 @@ class RobotTelemetry:
     gps_longitude: float
     gps_altitude: float
     gps_is_valid: bool
+
+    # Sensores de Proximidade (Indutivos)
+    sensor_obs_left: bool
+    sensor_obs_center: bool
+    sensor_obs_right: bool
 
     # Status do robo
     robot_moving: bool
@@ -75,7 +80,7 @@ class TelemetryService:
         """Inicia o loop de recolha de telemetria."""
         if self.collection_task is None:
             self.collection_task = asyncio.create_task(self._collection_loop())
-            logger.info("✓ Telemetry service started")
+            logger.info("✓ Serviço de telemetria iniciado")
 
     async def stop(self):
         """Para a recolha de telemetria."""
@@ -86,7 +91,7 @@ class TelemetryService:
             except asyncio.CancelledError:
                 pass
             self.collection_task = None
-            logger.info("✓ Telemetry service stopped")
+            logger.info("✓ Serviço de telemetria parado")
 
     async def update_robot_state(
         self,
@@ -140,7 +145,7 @@ class TelemetryService:
                     last_firebase_live = now
 
                 if config.DEBUG_MODE:
-                    logger.debug(f"Telemetry: V={telemetry.battery_voltage} | SaveHistory={save_history_flag}")
+                    logger.debug(f"Telemetria: V={telemetry.battery_voltage} | GuardarHistorico={save_history_flag}")
 
                 # O loop "acorda" no ritmo do Broadcast Interval (2s)
                 await asyncio.sleep(self.collection_interval)
@@ -148,7 +153,7 @@ class TelemetryService:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in telemetry collection loop: {e}")
+                logger.error(f"Erro no loop de recolha de telemetria: {e}")
                 await asyncio.sleep(2)
 
     async def _collect_telemetry(self) -> RobotTelemetry:
@@ -160,6 +165,7 @@ class TelemetryService:
             # Dados do Arduino (Seguro contra falhas de conexão)
             gps = self.serial_handler.get_latest_gps()
             battery = self.serial_handler.get_latest_battery()
+            sensors = self.serial_handler.get_latest_sensors()
 
             return RobotTelemetry(
                 timestamp=datetime.now().isoformat(),
@@ -182,6 +188,11 @@ class TelemetryService:
                 gps_altitude=gps.altitude,
                 gps_is_valid=gps.is_valid,
 
+                # Sensores
+                sensor_obs_left=sensors.obs_left,
+                sensor_obs_center=sensors.obs_center,
+                sensor_obs_right=sensors.obs_right,
+
                 # Status
                 robot_moving=self.robot_moving,
                 robot_rotation_direction=self.robot_rotation,
@@ -201,6 +212,7 @@ class TelemetryService:
             battery_voltage=0, battery_percentage=0, battery_current=0,
             battery_is_charging=False, battery_temperature=0,
             gps_latitude=0, gps_longitude=0, gps_altitude=0, gps_is_valid=False,
+            sensor_obs_left=False, sensor_obs_center=False, sensor_obs_right=False,
             robot_moving=False, robot_rotation_direction="NONE"
         )
 

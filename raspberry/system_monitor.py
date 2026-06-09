@@ -29,7 +29,7 @@ class SystemMetrics:
 class SystemMonitor:
     def __init__(self):
         self.latest_metrics = None
-        self.notification_service = None # Set by firmware.py
+        self.notification_service = None # Definido via firmware.py
 
     async def get_metrics(self) -> SystemMetrics:
         try:
@@ -38,7 +38,7 @@ class SystemMonitor:
             temp = self._get_temperature()
             disk = psutil.disk_usage('/')
             
-            # Stress Notifications
+            # Notificações de Stress
             if self.notification_service:
                 if temp > 80:
                     self.notification_service.broadcast_alert(
@@ -68,7 +68,7 @@ class SystemMonitor:
             self.latest_metrics = metrics
             return metrics
         except Exception as e:
-            logger.error(f"Metrics collection failed: {e}")
+            logger.error(f"Falha na recolha de métricas: {e}")
             return None
 
     def _get_temperature(self) -> float:

@@ -8,10 +8,14 @@
 void process_serial_command();
 void enviarTelemetriaGPS();
 void enviarTelemetriaBateria();
+void enviarTelemetriaSensores();
 void stop_all_motors();
 void drive_motor(struct MotorPins m, int speed);
 void drive_drum(int speed);
 void setup_motor(struct MotorPins m);
+void set_auto_mode(bool enabled);
+void gerir_modo_automatico();
+void ler_sensores_proximidade();
 
 // =======================
 // CONFIG
@@ -25,6 +29,10 @@ const float CALIBRACAO = 1.036;
 
 static const int GPS_RX_PIN = 19;
 static const int GPS_TX_PIN = 20;
+
+// Pinos para Sensores de Proximidade (Ex: HC-SR04)
+static const int SENSOR_FRENTE_TRIG = 3;
+static const int SENSOR_FRENTE_ECHO = 4;
 
 const unsigned long TEMPO_RECUPERACAO = 8000;
 
@@ -51,10 +59,19 @@ HardwareSerial GPSSerial(1);
 unsigned long command_timeout = 0;
 unsigned long last_battery_send = 0;
 unsigned long last_gps_send = 0;
+unsigned long last_sensor_send = 0;
 unsigned long ultimoMovimento = 0;
 
 bool motoresEmMovimento = false;
+bool autoModeEnabled = false;
 
+unsigned long last_auto_action = 0;
+
+// Estado dos sensores
+bool obstaculoDireita = false;
+bool obstaculoMeio = false;
+bool obstaculoEsquerda = false;
+ 
 float tensaoFiltrada = 0;
 float percentagemAtual = 0;
 
@@ -70,6 +87,11 @@ void setup() {
   setup_motor(mLeft);
   setup_motor(mRight);
   setup_motor(mDrum);
+
+  // Setup Sensores de Proximidade
+  pinMode(SENSOR_DIREITA, INPUT_PULLUP);
+  pinMode(SENSOR_MEIO, INPUT_PULLUP);
+  pinMode(SENSOR_ESQUERDA, INPUT_PULLUP);
 
   stop_all_motors();
 
@@ -88,9 +110,19 @@ void loop() {
     gps.encode(GPSSerial.read());
   }
 
+  // Lógica do Modo Automático Não-Bloqueante
+  if (autoModeEnabled) {
+    gerir_modo_automatico();
+  }
+
   if (millis() - last_gps_send > 1000) {
     enviarTelemetriaGPS();
     last_gps_send = millis();
+  }
+
+  if (millis() - last_sensor_send > 1000) {
+    enviarTelemetriaSensores();
+    last_sensor_send = millis();
   }
 
   if (millis() - last_battery_send > 5000) {
@@ -129,6 +161,11 @@ void process_serial_command() {
   // =========================
   if (strcmp(cmd, "MIXED_CONTROL") == 0) {
 
+    if (autoModeEnabled) {
+      Serial.println("{\"type\":\"ACK\",\"cmd\":\"MIXED_CONTROL\"}");
+      return;
+    }
+
     int left  = doc["left"]  | 0;
     int right = doc["right"] | 0;
     int drum  = doc["drum"]  | 0;
@@ -146,6 +183,11 @@ void process_serial_command() {
 
   // MOVE legacy
   if (strcmp(cmd, "MOVE") == 0) {
+    if (autoModeEnabled) {
+      Serial.println("{\"type\":\"ACK\",\"cmd\":\"MOVE\"}");
+      return;
+    }
+
     int speedL = doc["wheels"]["L"] | 0;
     int speedR = doc["wheels"]["R"] | 0;
 
@@ -161,6 +203,11 @@ void process_serial_command() {
 
   // DRUM legacy
   if (strcmp(cmd, "DRUM") == 0) {
+    if (autoModeEnabled) {
+      Serial.println("{\"type\":\"ACK\",\"cmd\":\"DRUM\"}");
+      return;
+    }
+
     int speed = doc["speed"] | 0;
     drive_drum(speed);
 
@@ -173,6 +220,14 @@ void process_serial_command() {
     command_timeout = 0;
 
     Serial.println("{\"type\":\"ACK\",\"cmd\":\"STOP\"}");
+    return;
+  }
+
+  if (strcmp(cmd, "AUTO_MODE") == 0) {
+    bool enabled = doc["enabled"] | false;
+    set_auto_mode(enabled);
+
+    Serial.println("{\"type\":\"ACK\",\"cmd\":\"AUTO_MODE\"}");
     return;
   }
 
@@ -232,6 +287,57 @@ void stop_all_motors() {
   }
 }
 
+void set_auto_mode(bool enabled) {
+  if (autoModeEnabled == enabled) return; // Evita resets desnecessários
+  
+  autoModeEnabled = enabled;
+  command_timeout = 0;
+  stop_all_motors();
+
+  if (enabled) {
+    last_auto_action = millis();
+    Serial.println("{\"type\":\"INFO\",\"msg\":\"AUTO_MODE_STARTED\"}");
+  } else {
+    Serial.println("{\"type\":\"INFO\",\"msg\":\"AUTO_MODE_STOPPED\"}");
+  }
+}
+
+// =======================
+// MODO AUTOMÁTICO & SENSORES
+// =======================
+void ler_sensores_proximidade() {
+  // Considerando INPUT_PULLUP, o estado normal é HIGH. 
+  // Quando deteta o obstáculo aterra o sinal e fica LOW.
+  // Se for ao contrário (ficar HIGH quando deteta), basta trocar LOW por HIGH abaixo.
+  obstaculoDireita = (digitalRead(SENSOR_DIREITA) == LOW);
+  obstaculoMeio = (digitalRead(SENSOR_MEIO) == LOW);
+  obstaculoEsquerda = (digitalRead(SENSOR_ESQUERDA) == LOW);
+}
+
+void gerir_modo_automatico() {
+  // Corre a cada 100ms (10Hz) para não saturar os motores nem bloquear a porta Serial
+  if (millis() - last_auto_action < 100) return;
+  last_auto_action = millis();
+
+  ler_sensores_proximidade();
+
+  if (obstaculoDireita || obstaculoMeio || obstaculoEsquerda) {
+    // Obstáculo detetado! 
+    stop_all_motors();
+    
+    // Lógica futura: Iniciar manobra de desvio (ex: rodar sobre o próprio eixo)
+    // drive_motor(mLeft, 150);
+    // drive_motor(mRight, -150);
+  } else {
+    // Caminho livre!
+    // Avançar e ligar sistema de recolha (tambor)
+    drive_motor(mLeft, 150);
+    drive_motor(mRight, 150);
+    drive_drum(200); 
+    motoresEmMovimento = true;
+  }
+}
+
 // =======================
 // TELEMETRY (placeholders ok)
 // =======================
@@ -255,6 +361,18 @@ void enviarTelemetriaBateria() {
   doc["voltage"] = 12.5;
   doc["percentage"] = 80;
   doc["is_moving"] = motoresEmMovimento;
+  doc["auto_mode"] = autoModeEnabled;
+ 
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void enviarTelemetriaSensores() {
+  StaticJsonDocument<200> doc;
+  doc["type"] = "SENSORS";
+  doc["left"] = obstaculoEsquerda;
+  doc["center"] = obstaculoMeio;
+  doc["right"] = obstaculoDireita;
 
   serializeJson(doc, Serial);
   Serial.println();

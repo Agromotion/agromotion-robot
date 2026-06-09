@@ -32,6 +32,15 @@ class BatteryData:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+@dataclass
+class SensorData:
+    obs_left: bool = False
+    obs_center: bool = False
+    obs_right: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 class SerialHandler:
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 1.0):
         self.port = port
@@ -39,10 +48,12 @@ class SerialHandler:
         self.timeout = timeout
         self.serial_connection: Optional[serial.Serial] = None
         self.is_connected = False
-        self.notification_service = None # Linked via firmware.py
+        self.notification_service = None # Ligado via firmware.py
+        self._write_lock = asyncio.Lock()
         
         self.latest_gps = GPSData()
         self.latest_battery = BatteryData()
+        self.latest_sensors = SensorData()
         self._gps_was_valid = False
         
         self.on_gps_received = None
@@ -55,45 +66,57 @@ class SerialHandler:
         try:
             self.serial_connection = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
             self.is_connected = True
-            logger.info(f"✓ Connected to Arduino at {self.port}")
+            logger.info(f"✓ Ligado ao Arduino na porta {self.port}")
             asyncio.create_task(self._read_loop())
             return True
         except Exception as e:
-            logger.error(f"✗ Failed to connect to Arduino: {e}")
+            logger.error(f"✗ Falha ao ligar ao Arduino: {e}")
             return False
 
     async def disconnect(self):
         if self.serial_connection and self.serial_connection.is_open:
             self.serial_connection.close()
             self.is_connected = False
-            logger.info("✓ Disconnected from Arduino")
+            logger.info("✓ Desligado do Arduino")
+
+    async def send_command(self, command: Dict[str, Any]) -> bool:
+        return await self._send_command(command)
 
     async def send_move_command(self, left: int, right: int, duration_ms: int = 100) -> bool:
         if not self.is_connected: return False
         command = {
-        "cmd": "MOVE",
-        "wheels": {
-            "L": max(-255, min(255, left)), 
-            "R": max(-255, min(255, right))
-        },
-        "duration": max(10, min(5000, duration_ms))
-    }
-        return await self._send_command(command)
+            "cmd": "MOVE",
+            "wheels": {
+                "L": max(-255, min(255, left)),
+                "R": max(-255, min(255, right))
+            },
+            "duration": max(10, min(5000, duration_ms))
+        }
+        return await self.send_command(command)
 
     async def send_stop_command(self) -> bool:
-        return await self._send_command({"cmd": "STOP"}) if self.is_connected else False
+        return await self.send_command({"cmd": "STOP"}) if self.is_connected else False
 
     async def send_ping(self) -> bool:
-        return await self._send_command({"cmd": "PING"}) if self.is_connected else False
+        return await self.send_command({"cmd": "PING"}) if self.is_connected else False
+
+    async def send_auto_mode_command(self, enabled: bool) -> bool:
+        if not self.is_connected:
+            return False
+        return await self.send_command({"cmd": "AUTO_MODE", "enabled": bool(enabled)})
 
     async def _send_command(self, command: Dict[str, Any]) -> bool:
         try:
             json_str = json.dumps(command) + "\n"
-            self.serial_connection.write(json_str.encode())
-            logger.info(f"→ Sent: {json_str.strip()}")
+            if not self.serial_connection or not self.serial_connection.is_open:
+                return False
+
+            async with self._write_lock:
+                self.serial_connection.write(json_str.encode())
+            logger.info(f"→ Enviado: {json_str.strip()}")
             return True
         except Exception as e:
-            logger.error(f"✗ Failed to send command: {e}")
+            logger.error(f"✗ Falha ao enviar comando: {e}")
             self.is_connected = False
             return False
 
@@ -110,7 +133,7 @@ class SerialHandler:
                             await self._process_message(line.strip())
                 await asyncio.sleep(0.01)
             except Exception as e:
-                logger.error(f"✗ Serial read error: {e}")
+                logger.error(f"✗ Erro de leitura série: {e}")
                 if self.notification_service:
                     self.notification_service.broadcast_alert(
                         "Hardware Offline", 
@@ -165,23 +188,31 @@ class SerialHandler:
                         "error"
                     )
 
+            elif msg_type == "SENSORS":
+                self.latest_sensors = SensorData(
+                    obs_left=data.get("left", False),
+                    obs_center=data.get("center", False),
+                    obs_right=data.get("right", False)
+                )
+
             elif msg_type == "ACK":
-                logger.debug(f"✓ ACK received for {data.get('cmd')}")
+                logger.debug(f"✓ ACK recebido para {data.get('cmd')}")
 
             elif msg_type == "ERROR":
                 if self.on_error_received: self.on_error_received(data.get("error"))
 
         except json.JSONDecodeError:
-                # Silencia o erro se não for um JSON completo (evita spam no log)
+            # Silencia o erro se não for um JSON completo (evita spam no log)
             logger.debug(f"Ignorada linha não-JSON: {message}")
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
+            logger.error(f"Erro ao processar mensagem: {e}")
 
     def get_latest_gps(self) -> GPSData: return self.latest_gps
     def get_latest_battery(self) -> BatteryData: return self.latest_battery
+    def get_latest_sensors(self) -> SensorData: return self.latest_sensors
 
     async def health_check(self) -> Dict[str, Any]:
-        """Verify Arduino connection health."""
+        """Verifica a saúde da ligação ao Arduino."""
         await self.send_ping()
         await asyncio.sleep(0.1)
         return {

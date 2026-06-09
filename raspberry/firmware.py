@@ -10,6 +10,7 @@ from serial_handler import SerialHandler
 from video_streaming import VideoStreamingManager
 from command_handler import CommandHandler
 from firebase_manager import FirebaseManager
+from robot_mode_manager import RobotModeManager
 from telemetry_service import TelemetryService
 
 logging.basicConfig(
@@ -33,10 +34,11 @@ class RobotFirmware:
         self.video_manager = None
         self.firebase_manager = FirebaseManager(self)
         self.command_handler = CommandHandler()
+        self.mode_manager = RobotModeManager(self.serial_handler)
         self.telemetry_service = None
 
         # -----------------------------
-        # 🔒 CONTROL SYNCHRONIZATION LAYER
+        # CAMADA DE SINCRONIZAÇÃO DE CONTROLO
         # -----------------------------
         self._control_lock = asyncio.Lock()
         self._control_state = {
@@ -49,7 +51,7 @@ class RobotFirmware:
         self._dispatcher_task: Optional[asyncio.Task] = None
 
     # =========================================================
-    # INITIALIZATION
+    # INICIALIZAÇÃO
     # =========================================================
 
     async def initialize(self) -> bool:
@@ -63,6 +65,7 @@ class RobotFirmware:
 
         self.system_monitor.notification_service = notif
         self.serial_handler.notification_service = notif
+        self.firebase_manager.on_auto_mode_change = self._on_auto_mode_change
 
         if not await self.serial_handler.connect():
             logger.warning("Arduino não detetado (modo simulação).")
@@ -72,8 +75,6 @@ class RobotFirmware:
             logger.error("Falha no vídeo.")
             return False
 
-        self.firebase_manager.start_listening()
-
         self.telemetry_service = TelemetryService(
             self.system_monitor,
             self.serial_handler
@@ -82,20 +83,26 @@ class RobotFirmware:
 
         self.firebase_manager.on_control_change = self._on_control_change
 
+        self.firebase_manager.start_listening()
+
+        current_auto_mode = self.firebase_manager.get_current_auto_mode()
+        if current_auto_mode is not None:
+            await self.mode_manager.set_auto_mode(current_auto_mode, force=True)
+
         await self.telemetry_service.start()
 
-        # 🔥 START DISPATCH LOOP (KEY FIX)
+        # INICIAR LOOP DO DISPATCHER (CORREÇÃO CHAVE)
         self._dispatcher_task = asyncio.create_task(self._dispatch_loop())
 
         return True
 
     # =========================================================
-    # CONTROL CALLBACKS (RECEIVE INPUT ONLY)
+    # CALLBACKS DE CONTROLO (APENAS RECEÇÃO DE INPUT)
     # =========================================================
 
     async def execute_command(self, x: float, y: float, user: str):
         active_user = self.firebase_manager.access_manager.current_controller
-        if user != active_user:
+        if user != active_user or self.mode_manager.auto_mode_enabled:
             return
 
         async with self._control_lock:
@@ -105,7 +112,7 @@ class RobotFirmware:
 
     async def execute_drum(self, value: float, user: str):
         active_user = self.firebase_manager.access_manager.current_controller
-        if user != active_user:
+        if user != active_user or self.mode_manager.auto_mode_enabled:
             return
 
         async with self._control_lock:
@@ -113,7 +120,7 @@ class RobotFirmware:
             self._control_state["ts"] = asyncio.get_event_loop().time()
 
     # =========================================================
-    # 🔥 CENTRAL DISPATCHER (FIX FOR "BREAKS")
+    # DISPATCHER CENTRAL
     # =========================================================
 
     async def _dispatch_loop(self):
@@ -125,6 +132,10 @@ class RobotFirmware:
 
         while self.running:
             await asyncio.sleep(0.02)  # 50Hz (suave e estável)
+
+            if self.mode_manager.auto_mode_enabled:
+                last_sent = None
+                continue
 
             async with self._control_lock:
                 x = self._control_state["x"]
@@ -140,7 +151,7 @@ class RobotFirmware:
             last_sent = snapshot
 
             # -----------------------------
-            # JOYSTICK PROCESSING
+            # PROCESSAMENTO DO JOYSTICK
             # -----------------------------
             wheel_cmds = self.command_handler.process_joystick(
                 x,
@@ -159,12 +170,12 @@ class RobotFirmware:
             )
 
             # -----------------------------
-            # DRUM PROCESSING
+            # PROCESSAMENTO DO TAMBOR
             # -----------------------------
             drum_speed = int(drum * 255)
 
             # -----------------------------
-            # SINGLE SYNC COMMAND PACKET
+            # PACOTE DE COMANDO DE SINCRONIZAÇÃO ÚNICA
             # -----------------------------
             command = {
                 "cmd": "MIXED_CONTROL",
@@ -174,12 +185,12 @@ class RobotFirmware:
             }
 
             try:
-                await self.serial_handler._send_command(command)
+                await self.serial_handler.send_command(command)
             except Exception as e:
                 logger.warning(f"Erro envio comando: {e}")
 
     # =========================================================
-    # CONTROL EVENTS
+    # EVENTOS DE CONTROLO
     # =========================================================
 
     def _on_control_change(self, user_email: Optional[str], is_controlled: bool):
@@ -201,8 +212,11 @@ class RobotFirmware:
             )
         )
 
+    def _on_auto_mode_change(self, enabled: bool, force: bool = False):
+        asyncio.create_task(self.mode_manager.set_auto_mode(enabled, force=force))
+
     # =========================================================
-    # RUN LOOP
+    # LOOP PRINCIPAL
     # =========================================================
 
     async def run(self):
@@ -213,7 +227,7 @@ class RobotFirmware:
             await asyncio.sleep(1.0)
 
     # =========================================================
-    # SHUTDOWN
+    # ENCERRAMENTO
     # =========================================================
 
     async def shutdown(self):
@@ -243,7 +257,7 @@ class RobotFirmware:
 
 
 # =========================================================
-# MAIN
+# PRINCIPAL
 # =========================================================
 
 async def main():

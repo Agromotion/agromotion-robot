@@ -36,3 +36,11 @@ bash install.sh --firmware video  # Executar com vídeo
 ```
 
 Para mais detalhes, aceda à [documentação completa](../DOCUMENTATION.md).
+
+## Modo Automático
+
+O robô passa a escutar o campo `status.autoMode` no Firestore.
+
+- Quando `status.autoMode` muda, o Raspberry envia `{"cmd":"AUTO_MODE","enabled":true|false}` ao Arduino.
+- Com o modo automático ativo, os comandos manuais `MOVE`, `DRUM` e `MIXED_CONTROL` são ignorados no firmware.
+- Ao desativar o modo automático, o estado é reenviado ao Arduino para manter a sincronização.

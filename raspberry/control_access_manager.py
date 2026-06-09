@@ -1,6 +1,6 @@
 """
-Control access manager - handles who can control the robot
-Only one user can control at a time, others see who is controlling
+Gestor de acesso de controlo - gere quem pode controlar o robô
+Apenas um utilizador pode controlar de cada vez, os outros veem quem está a controlar
 """
 
 import logging
