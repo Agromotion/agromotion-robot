@@ -140,6 +140,13 @@ class ControlAccessManager:
             return True
         return False
 
+    def is_inactive(self, timeout_seconds: Optional[int] = None) -> bool:
+        """Verifica se o tempo de inatividade foi excedido."""
+        if not self.current_controller or not self.last_activity_time:
+            return False
+        timeout = timedelta(seconds=timeout_seconds) if timeout_seconds is not None else self.control_timeout
+        return (datetime.now() - self.last_activity_time) > timeout
+
     # ========================================================================
     # Métodos Privados
     # ========================================================================

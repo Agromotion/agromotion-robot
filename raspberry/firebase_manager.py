@@ -126,6 +126,13 @@ class FirebaseManager:
 
                     pc = self._get_pc()
 
+                    # Se a app apagou a sessão WebRTC (user desconectou ou saiu), fechamos a ligação local e rodamos a fila
+                    if not session and pc:
+                        logger.info("webrtc_session foi apagada pela App. A fechar ligação e promover o próximo na fila...")
+                        asyncio.run_coroutine_threadsafe(self.webrtc_manager.close(), self.loop)
+                        asyncio.run_coroutine_threadsafe(self._promote_next_controller(), self.loop)
+                        continue
+
                     if session and session.get("offer") and not session.get("answer"):
                         if pc and pc.iceConnectionState in ["checking", "connected", "completed"]:
                             logger.warning("Ignorando nova offer - handshake em progresso")
@@ -157,14 +164,7 @@ class FirebaseManager:
 
                     app_candidates = data.get("app_candidates", [])
                     if app_candidates and self.webrtc_manager:
-                        add_candidate = getattr(self.webrtc_manager, "add_ice_candidate", None)
-
-                        if callable(add_candidate):
-                            for cand_data in app_candidates:
-                                asyncio.run_coroutine_threadsafe(
-                                    add_candidate(cand_data),
-                                    self.loop,
-                                )
+                        self.webrtc_manager.process_candidates(app_candidates)
 
             except Exception as e:
                 logger.error(f"Erro no listener do Firestore: {e}", exc_info=True)
@@ -174,32 +174,23 @@ class FirebaseManager:
     async def _control_timeout_loop(self):
         while True:
             await asyncio.sleep(2)
+            try:
+                if not self.current_controller:
+                    continue
 
-            if not self.current_controller:
-                continue
+                pc = self._get_pc()
 
-            pc = self._get_pc()
+                if pc and pc.iceConnectionState in ["checking"]:
+                    self.access_manager.update_activity(self.current_controller)
+                    continue
 
-            if pc and pc.iceConnectionState in ["checking"]:
-                self.access_manager.update_activity(self.current_controller)
-                continue
-
-            if self.access_manager.is_inactive(timeout_seconds=20):
-                logger.warning(f"Perda de sinal de {self.current_controller}. A libertar controlo...")
-
-                if pc:
-                    try:
-                        pc.on("iceconnectionstatechange", None)
-                        pc.on("icecandidate", None)
-                        pc.on("datachannel", None)
-                        await pc.close()
-                    except Exception:
-                        pass
-
-                    if self.webrtc_manager:
-                        self.webrtc_manager.pc = None
-
-                await self._promote_next_controller()
+                if self.access_manager.is_inactive(timeout_seconds=20):
+                    logger.warning(f"Perda de sinal de {self.current_controller}. A libertar controlo...")
+                    if pc and self.webrtc_manager:
+                        await self.webrtc_manager.close()
+                    await self._promote_next_controller()
+            except Exception as e:
+                logger.error(f"Erro no loop de inatividade de controlo: {e}")
 
     def _start_schedules_listener(self):
         def on_snapshot(col_snapshot, changes, read_time):
@@ -285,6 +276,17 @@ class FirebaseManager:
         next_user = status["current_controller"]
 
         self.current_controller = next_user
+
+        # Limpar sessão WebRTC no Firestore para que o novo utilizador comece um handshake do zero
+        try:
+            self.doc_ref.update({
+                "webrtc_session": None,
+                "app_candidates": [],
+                "robot_candidates": []
+            })
+        except Exception as e:
+            logger.error(f"Erro ao limpar webrtc_session na promoção: {e}")
+
         self._sync_control_state()
 
         if self.on_control_change:

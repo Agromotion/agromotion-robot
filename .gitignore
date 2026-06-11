@@ -7,3 +7,4 @@ camera/simulator LiveKit/.env
 raspberry/secrets.json
 raspberry/.env
 raspberry/setup.log
+raspberry/secrets.json
