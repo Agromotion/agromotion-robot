@@ -74,11 +74,17 @@ class WebRTCManager:
 
             @self.pc.on("iceconnectionstatechange")
             async def on_ice_connection_state():
-                if self.pc:
-                    state = self.pc.iceConnectionState
+                pc_ref = getattr(self, "pc", None)
+                if pc_ref:
+                    state = pc_ref.iceConnectionState
                     logger.info(f"Estado de ligação ICE: {state}")
                     if state in ["failed", "closed", "disconnected"]:
-                        if self.on_disconnect: await self.on_disconnect()
+                        await self.close()
+                        if self.on_disconnect: 
+                            if asyncio.iscoroutinefunction(self.on_disconnect):
+                                await self.on_disconnect()
+                            else:
+                                self.on_disconnect()
 
             @self.pc.on("icecandidate")
             async def on_icecandidate(candidate):
@@ -171,11 +177,17 @@ class WebRTCManager:
     async def close(self):
         """Fecha conexões ativas e limpa variáveis de sessão."""
         if self.pc:
+            pc_ref = self.pc
+            self.pc = None
             try:
-                self.pc.on("iceconnectionstatechange", None)
-                self.pc.on("icecandidate", None)
-                self.pc.on("datachannel", None)
-                await self.pc.close()
+                pc_ref.on("iceconnectionstatechange", None)
+                pc_ref.on("icecandidate", None)
+                pc_ref.on("datachannel", None)
+                await pc_ref.close()
             except Exception:
                 pass
-            self.pc = None
+
+        self._processed_app_candidates.clear()
+        self._pending_candidates.clear()
+        self._remote_description_set = False
+        self.handling_offer = False
