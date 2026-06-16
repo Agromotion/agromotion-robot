@@ -89,11 +89,16 @@ class WebRTCManager:
             @self.pc.on("icecandidate")
             async def on_icecandidate(candidate):
                 if candidate:
-                    self.doc_ref.update({
-                        'robot_candidates': firestore.ArrayUnion([{
-                            'candidate': candidate.candidate, 'sdpMid': candidate.sdpMid, 'sdpMLineIndex': candidate.sdpMLineIndex
-                        }])
-                    })
+                    def _send_candidate():
+                        try:
+                            self.doc_ref.update({
+                                'robot_candidates': firestore.ArrayUnion([{
+                                    'candidate': candidate.candidate, 'sdpMid': candidate.sdpMid, 'sdpMLineIndex': candidate.sdpMLineIndex
+                                }])
+                            })
+                        except Exception as e:
+                            logger.error(f"Erro ao enviar candidato ICE: {e}")
+                    self.loop.run_in_executor(None, _send_candidate)
 
             @self.pc.on("datachannel")
             def on_datachannel(channel):
@@ -136,9 +141,15 @@ class WebRTCManager:
             answer = await self.pc.createAnswer()
             await self.pc.setLocalDescription(answer)
             
-            self.doc_ref.update({
-                'webrtc_session.answer': {'sdp': self.pc.localDescription.sdp, 'type': self.pc.localDescription.type}
-            })
+            def _send_answer():
+                try:
+                    self.doc_ref.update({
+                        'webrtc_session.answer': {'sdp': self.pc.localDescription.sdp, 'type': self.pc.localDescription.type}
+                    })
+                except Exception as e:
+                    logger.error(f"Erro ao publicar Answer: {e}")
+            
+            self.loop.run_in_executor(None, _send_answer)
             logger.info("✓ Answer publicada. Aguardando ICE...")
 
         except Exception as e:
