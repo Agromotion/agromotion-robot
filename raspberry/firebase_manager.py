@@ -159,6 +159,9 @@ class FirebaseManager:
                         asyncio.run_coroutine_threadsafe(self.webrtc_manager.close(email), self.loop)
                     if self.current_controller == email:
                         asyncio.run_coroutine_threadsafe(self._promote_next_controller(), self.loop)
+                    else:
+                        self.access_manager.release_control(email)
+                        self._sync_control_state()
                     continue
 
                 if not data:
