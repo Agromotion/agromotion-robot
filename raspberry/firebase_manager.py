@@ -41,6 +41,7 @@ class FirebaseManager:
         self._snapshot_listener = None
         self._timeout_task = None
         self._schedules_listener = None
+        self._viewers_listener = None
 
         self.schedules = []
         self._triggered_schedules = {}
@@ -56,17 +57,36 @@ class FirebaseManager:
 
             logger.info("A limpar sessões WebRTC e fila de controlo...")
 
-            self.doc_ref.update({
-                "webrtc_session": None,
-                "app_candidates": [],
-                "robot_candidates": [],
-                "status.online": True,
-                "status.video_client_count": 0,
-                "status.last_boot": firestore.SERVER_TIMESTAMP,
-                "control.active_controller_email": None,
-                "control.viewer_queue": [],
-                "control.last_access": firestore.SERVER_TIMESTAMP,
-            })
+            try:
+                self.doc_ref.update({
+                    "webrtc_session": None,
+                    "app_candidates": [],
+                    "robot_candidates": [],
+                    "status.online": True,
+                    "status.video_client_count": 0,
+                    "status.last_boot": firestore.SERVER_TIMESTAMP,
+                    "control.active_controller_email": None,
+                    "control.viewer_queue": [],
+                    "control.last_access": firestore.SERVER_TIMESTAMP,
+                })
+            except Exception:
+                # Fallback caso o documento do robô não exista no Firestore (previne crash)
+                logger.warning("Documento do robô não encontrado. A criar novo estado online...")
+                self.doc_ref.set({
+                    "webrtc_session": None,
+                    "app_candidates": [],
+                    "robot_candidates": [],
+                    "status": {
+                        "online": True,
+                        "video_client_count": 0,
+                        "last_boot": firestore.SERVER_TIMESTAMP,
+                    },
+                    "control": {
+                        "active_controller_email": None,
+                        "viewer_queue": [],
+                        "last_access": firestore.SERVER_TIMESTAMP,
+                    }
+                }, merge=True)
 
             self.notification_service = NotificationService(self.db, self.robot_id)
 
@@ -115,61 +135,58 @@ class FirebaseManager:
                     if not data:
                         continue
 
-                    control_data = data.get("control", {})
-                    app_email = control_data.get("last_handshake_email")
-                    session = data.get("webrtc_session")
                     status_data = data.get("status", {})
 
                     auto_mode = status_data.get("autoMode")
                     if isinstance(auto_mode, bool):
                         self._handle_auto_mode_change(auto_mode)
 
-                    pc = self._get_pc()
-
-                    # Se a app apagou a sessão WebRTC (user desconectou ou saiu), fechamos a ligação local e rodamos a fila
-                    if not session and pc:
-                        logger.info("webrtc_session foi apagada pela App. A fechar ligação e promover o próximo na fila...")
-                        asyncio.run_coroutine_threadsafe(self.webrtc_manager.close(), self.loop)
-                        asyncio.run_coroutine_threadsafe(self._promote_next_controller(), self.loop)
-                        continue
-
-                    if session and session.get("offer") and not session.get("answer"):
-                        if pc and pc.iceConnectionState in ["checking", "connected", "completed"]:
-                            logger.warning("Ignorando nova offer - handshake em progresso")
-                            continue
-
-                        if self.webrtc_manager and not self.webrtc_manager.handling_offer:
-                            if app_email:
-                                logger.info(f"Pedido de controlo recebido: {app_email}")
-                                self.access_manager.request_control(app_email)
-                                self.access_manager.update_activity(app_email)
-                                self.current_controller = self.access_manager.current_controller
-                                self._sync_control_state()
-
-                            logger.info(f"Oferta WebRTC de {app_email}. A iniciar ligação...")
-
-                            asyncio.run_coroutine_threadsafe(
-                                self.webrtc_manager.handle_offer(session["offer"]),
-                                self.loop,
-                            )
-
-                            continue
-
-                    pc = self._get_pc()
-
-                    if pc and pc.iceConnectionState in ["checking", "completed", "connected"]:
-                        if not app_email or app_email == "unknown":
-                            logger.debug("Snapshot de limpeza ignorado para proteger handshake ativo.")
-                            continue
-
-                    app_candidates = data.get("app_candidates", [])
-                    if app_candidates and self.webrtc_manager:
-                        self.webrtc_manager.process_candidates(app_candidates)
-
             except Exception as e:
                 logger.error(f"Erro no listener do Firestore: {e}", exc_info=True)
 
         self._snapshot_listener = self.doc_ref.on_snapshot(on_snapshot)
+
+    def _start_viewers_listener(self):
+        def on_snapshot(col_snapshot, changes, read_time):
+            for change in changes:
+                doc = change.document
+                email = doc.id
+                data = doc.to_dict()
+
+                if change.type.name == 'REMOVED':
+                    logger.info(f"Espectador {email} saiu. A fechar stream...")
+                    if self.webrtc_manager:
+                        asyncio.run_coroutine_threadsafe(self.webrtc_manager.close(email), self.loop)
+                    if self.current_controller == email:
+                        asyncio.run_coroutine_threadsafe(self._promote_next_controller(), self.loop)
+                    continue
+
+                if not data:
+                    continue
+
+                session = data.get("webrtc_session")
+                if session and session.get("offer") and not session.get("answer"):
+                    if self.webrtc_manager and not self.webrtc_manager.is_handling(email):
+                        pc = self.webrtc_manager.get_pc(email)
+                        if pc and pc.iceConnectionState in ["checking", "connected", "completed"]:
+                            continue
+
+                        logger.info(f"Conexão de visualização/controlo solicitada por: {email}")
+                        self.access_manager.request_control(email)
+                        self.access_manager.update_activity(email)
+                        self.current_controller = self.access_manager.current_controller
+                        self._sync_control_state()
+
+                        asyncio.run_coroutine_threadsafe(
+                            self.webrtc_manager.handle_offer(email, session["offer"]),
+                            self.loop,
+                        )
+
+                app_candidates = data.get("app_candidates", [])
+                if app_candidates and self.webrtc_manager:
+                    self.webrtc_manager.process_candidates(email, app_candidates)
+
+        self._viewers_listener = self.doc_ref.collection("viewers").on_snapshot(on_snapshot)
 
     async def _control_timeout_loop(self):
         while True:
@@ -178,16 +195,21 @@ class FirebaseManager:
                 if not self.current_controller:
                     continue
 
-                pc = self._get_pc()
+                email = self.current_controller
+                pc = self.webrtc_manager.get_pc(email) if self.webrtc_manager else None
 
                 if pc and pc.iceConnectionState in ["checking"]:
-                    self.access_manager.update_activity(self.current_controller)
+                    self.access_manager.update_activity(email)
+                    continue
+
+                if self.webrtc_manager and self.webrtc_manager.is_handling(email):
+                    self.access_manager.update_activity(email)
                     continue
 
                 if self.access_manager.is_inactive(timeout_seconds=20):
-                    logger.warning(f"Perda de sinal de {self.current_controller}. A libertar controlo...")
+                    logger.warning(f"Perda de sinal de {email}. A libertar controlo...")
                     if pc and self.webrtc_manager:
-                        await self.webrtc_manager.close()
+                        await self.webrtc_manager.close(email)
                     await self._promote_next_controller()
             except Exception as e:
                 logger.error(f"Erro no loop de inatividade de controlo: {e}")
@@ -277,16 +299,6 @@ class FirebaseManager:
 
         self.current_controller = next_user
 
-        # Limpar sessão WebRTC no Firestore para que o novo utilizador comece um handshake do zero
-        try:
-            self.doc_ref.update({
-                "webrtc_session": None,
-                "app_candidates": [],
-                "robot_candidates": []
-            })
-        except Exception as e:
-            logger.error(f"Erro ao limpar webrtc_session na promoção: {e}")
-
         self._sync_control_state()
 
         if self.on_control_change:
@@ -359,14 +371,21 @@ class FirebaseManager:
         if not self._snapshot_listener:
             logger.info("Robô agora está a ouvir pedidos de conexão.")
             self._start_firestore_listener()
+            self._start_viewers_listener()
 
-        self.doc_ref.update({"status.video_ready": True})
+        self.doc_ref.update({
+            "status.online": True,
+            "status.video_ready": True
+        })
 
     async def disconnect(self):
         logger.info("A encerrar Firebase Manager...")
 
         if self._snapshot_listener:
             self._snapshot_listener.unsubscribe()
+            
+        if self._viewers_listener:
+            self._viewers_listener.unsubscribe()
 
         if self._schedules_listener:
             self._schedules_listener.unsubscribe()
