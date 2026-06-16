@@ -66,7 +66,7 @@ class VideoStreamingManager:
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                preexec_fn=self._ignore_sigint,
+                start_new_session=True,
                 text=True,
                 bufsize=1
             )
@@ -103,7 +103,7 @@ class VideoStreamingManager:
                 shell=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                preexec_fn=self._ignore_sigint
+                start_new_session=True
             )
 
             # Verificar se o pipeline sobreviveu ao arranque
@@ -156,8 +156,3 @@ class VideoStreamingManager:
         video_alive = self.video_process and self.video_process.poll() is None
         
         return self.is_streaming and mediamtx_alive and video_alive
-
-    @staticmethod
-    def _ignore_sigint():
-        """Evita que o sinal de interrupção mate os subprocessos prematuramente"""
-        signal.signal(signal.SIGINT, signal.SIG_IGN)

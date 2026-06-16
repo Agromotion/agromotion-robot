@@ -1,3 +1,6 @@
+import os
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "1"
+
 import asyncio
 import logging
 import signal
@@ -57,10 +60,21 @@ class RobotFirmware:
     async def initialize(self) -> bool:
         logger.info(f"🚀 Iniciando firmware para: {config.ROBOT_NAME}...")
 
+        self.video_manager = VideoStreamingManager()
+        if not await self.video_manager.start():
+            logger.error("Falha no vídeo.")
+            return False
+
         if not self.firebase_manager.initialize():
             logger.error("Firebase falhou.")
             return False
 
+        # Notificação de arranque
+        self.firebase_manager.notification_service.broadcast_alert(
+            title=f"{config.ROBOT_NAME} Online",
+            message="O sistema do robô está online.",
+            alert_type="info"
+        )
         notif = self.firebase_manager.notification_service
 
         self.system_monitor.notification_service = notif
@@ -69,11 +83,6 @@ class RobotFirmware:
 
         if not await self.serial_handler.connect():
             logger.warning("Arduino não detetado (modo simulação).")
-
-        self.video_manager = VideoStreamingManager()
-        if not await self.video_manager.start():
-            logger.error("Falha no vídeo.")
-            return False
 
         self.telemetry_service = TelemetryService(
             self.system_monitor,
@@ -236,6 +245,14 @@ class RobotFirmware:
 
         logger.info("🛑 Shutdown...")
 
+        # Notificação de encerramento
+        if self.firebase_manager and self.firebase_manager.notification_service:
+            self.firebase_manager.notification_service.broadcast_alert(
+                title=f"{config.ROBOT_NAME} Offline",
+                message="O robô está a ser desligado.",
+                alert_type="info",
+                cooldown_seconds=0
+            )
         self.running = False
 
         if self._dispatcher_task:

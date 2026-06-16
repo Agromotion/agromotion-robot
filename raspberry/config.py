@@ -76,6 +76,7 @@ MOVEMENT_DEADZONE = 0.1  # Ignorar valores abaixo de 10%
 TELEMETRY_BROADCAST_INTERVAL = 2 # segundos (0.5 Hz) - Reduzido de 0.5s
 TELEMETRY_FIREBASE_INTERVAL = 10.0  # Gravar no Firebase a cada 10 segundos - Reduzido de 5s
 TELEMETRY_HISTORY_INTERVAL = 600.0 # 10 minutos
+LOCATION_UPDATE_THRESHOLD = 0.00005 # Apenas atualiza GPS se mover > 5.5 metros
 # ============================================================================
 # BLOQUEIO DE CONTROLO
 # ============================================================================

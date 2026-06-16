@@ -58,12 +58,9 @@ class NotificationService:
 
         # Enviar Notificação Push em Tempo Real via FCM (Tópico)
         try:
-            # Configuração visual por tipo de alerta
-            emoji = "⚠️" if alert_type == "warning" else "🚨" if alert_type == "error" else "🤖"
-            
             msg = messaging.Message(
                 notification=messaging.Notification(
-                    title=f"{emoji} {title}",
+                    title=title,
                     body=message
                 ),
                 # Payload de dados para a lógica interna da App

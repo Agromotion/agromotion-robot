@@ -38,11 +38,6 @@ class RobotTelemetry:
     gps_altitude: float
     gps_is_valid: bool
 
-    # Sensores de Proximidade (Indutivos)
-    sensor_obs_left: bool
-    sensor_obs_center: bool
-    sensor_obs_right: bool
-
     # Status do robo
     robot_moving: bool
     robot_rotation_direction: str  # "CW", "CCW", "NONE"
@@ -66,6 +61,10 @@ class TelemetryService:
         self.robot_moving = False
         self.robot_rotation = "NONE"
         self.active_controller = None
+
+        # Controlo de atualização de localização
+        self.last_sent_lat: Optional[float] = None
+        self.last_sent_lon: Optional[float] = None
 
         # Callback para o firmware.py enviar para o Firebase
         self.on_telemetry_update: Optional[Callable[[RobotTelemetry], None]] = None
@@ -135,12 +134,33 @@ class TelemetryService:
                     save_history_flag = True
                     last_history_save = now
                     logger.info("🕒 Intervalo de histórico atingido (10 min).")
-
+                
                 # Se atingiu o intervalo de 10 segundos, envia para o Firebase
                 if elapsed_live >= self.firebase_save_interval:
+                    # Lógica para evitar spam de localização quando parado
+                    should_update_location = True
+                    if (self.last_sent_lat is not None and 
+                        self.last_sent_lon is not None and 
+                        telemetry.gps_is_valid):
+                        
+                        lat_diff = abs(self.last_sent_lat - telemetry.gps_latitude)
+                        lon_diff = abs(self.last_sent_lon - telemetry.gps_longitude)
+                        
+                        if lat_diff < config.LOCATION_UPDATE_THRESHOLD and lon_diff < config.LOCATION_UPDATE_THRESHOLD:
+                            should_update_location = False
+                    
+                    # Se não houve movimento significativo, envia as coordenadas antigas para não mover no mapa
+                    if not should_update_location:
+                        telemetry.gps_latitude = self.last_sent_lat
+                        telemetry.gps_longitude = self.last_sent_lon
+
                     if self.on_telemetry_update:
-                        # Envia os dados e a flag indicando se deve criar novo documento no histórico
                         self.on_telemetry_update(telemetry, save_history=save_history_flag)
+
+                    # Atualiza a última posição enviada apenas se foi uma atualização real e válida
+                    if telemetry.gps_is_valid and should_update_location:
+                        self.last_sent_lat = telemetry.gps_latitude
+                        self.last_sent_lon = telemetry.gps_longitude
 
                     last_firebase_live = now
 
@@ -188,11 +208,6 @@ class TelemetryService:
                 gps_altitude=gps.altitude,
                 gps_is_valid=gps.is_valid,
 
-                # Sensores
-                sensor_obs_left=sensors.obs_left,
-                sensor_obs_center=sensors.obs_center,
-                sensor_obs_right=sensors.obs_right,
-
                 # Status
                 robot_moving=self.robot_moving,
                 robot_rotation_direction=self.robot_rotation,
@@ -212,7 +227,6 @@ class TelemetryService:
             battery_voltage=0, battery_percentage=0, battery_current=0,
             battery_is_charging=False, battery_temperature=0,
             gps_latitude=0, gps_longitude=0, gps_altitude=0, gps_is_valid=False,
-            sensor_obs_left=False, sensor_obs_center=False, sensor_obs_right=False,
             robot_moving=False, robot_rotation_direction="NONE"
         )
 
