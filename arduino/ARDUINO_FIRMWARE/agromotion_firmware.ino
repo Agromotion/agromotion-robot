@@ -1,6 +1,8 @@
 #include <ArduinoJson.h>
 #include <TinyGPS++.h>
 #include <HardwareSerial.h>
+#include <Wire.h>
+#include <VL53L0X.h>
 
 // =======================
 // FORWARD DECLARATIONS
@@ -19,6 +21,8 @@ void ler_sensores_proximidade();
 void clique_pirilampo();
 void ativar_pirilampo();
 void desligar_pirilampo();
+void setup_sensor_obstaculo();
+bool obstaculo_frontal_detetado();
 
 // =======================
 // CONFIG
@@ -33,25 +37,26 @@ const float CALIBRACAO = 1.036;
 static const int GPS_RX_PIN = 19;
 static const int GPS_TX_PIN = 20;
 
-// Sensores de indução / navegação
 static const int SENSOR_DIREITA = 40;
 static const int SENSOR_MEIO = 41;
 static const int SENSOR_ESQUERDA = 42;
 
+// Sensor obstáculo VL53L0X
+#define VL53_SDA 38
+#define VL53_SCL 37
+const int DISTANCIA_OBSTACULO_MM = 100;
+
 const unsigned long TEMPO_RECUPERACAO = 8000;
 
-// Velocidades do modo automático
-const int AUTO_RETO = 150;
+const int AUTO_RETO = 255;
 const int AUTO_CURVA_SUAVE_RAPIDO = 155;
 const int AUTO_CURVA_SUAVE_LENTO = 110;
-const int AUTO_CURVA_FORTE_RAPIDO = 160;
+const int AUTO_CURVA_FORTE_RAPIDO = 200;
 const int AUTO_CURVA_FORTE_LENTO = 70;
-const int AUTO_TAMBOR = 200;
-
+const int AUTO_TAMBOR = 80;
 
 static const int PIN_PIRILAMPO = 48;
 const unsigned long TEMPO_CLIQUE_PIRILAMPO = 250;
-
 
 // =======================
 // STRUCTS
@@ -72,6 +77,7 @@ MotorPins mDrum  = {15, 16, 17, 18};
 // =======================
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
+VL53L0X sensorObstaculo;
 
 unsigned long command_timeout = 0;
 unsigned long last_battery_send = 0;
@@ -87,6 +93,10 @@ unsigned long last_auto_action = 0;
 bool obstaculoDireita = false;
 bool obstaculoMeio = false;
 bool obstaculoEsquerda = false;
+
+bool sensorObstaculoOK = false;
+int distanciaObstaculoMM = 9999;
+bool obstaculoFrontal = false;
 
 float tensaoFiltrada = 0;
 float percentagemAtual = 0;
@@ -107,6 +117,8 @@ void setup() {
   pinMode(SENSOR_DIREITA, INPUT_PULLUP);
   pinMode(SENSOR_MEIO, INPUT_PULLUP);
   pinMode(SENSOR_ESQUERDA, INPUT_PULLUP);
+
+  setup_sensor_obstaculo();
 
   stop_all_motors();
 
@@ -329,12 +341,17 @@ void gerir_modo_automatico() {
   if (millis() - last_auto_action < 100) return;
   last_auto_action = millis();
 
+  if (obstaculo_frontal_detetado()) {
+    stop_all_motors();
+    return;
+  }
+
   ler_sensores_proximidade();
 
   if (obstaculoMeio && !obstaculoEsquerda && !obstaculoDireita) {
     drive_motor(mLeft, AUTO_RETO);
     drive_motor(mRight, AUTO_RETO);
-    drive_drum(AUTO_TAMBOR);
+    drive_drum(0);
     motoresEmMovimento = true;
     return;
   }
@@ -342,7 +359,7 @@ void gerir_modo_automatico() {
   if (obstaculoMeio && obstaculoEsquerda && !obstaculoDireita) {
     drive_motor(mLeft, AUTO_CURVA_SUAVE_LENTO);
     drive_motor(mRight, AUTO_CURVA_SUAVE_RAPIDO);
-    drive_drum(AUTO_TAMBOR);
+    drive_drum(0);
     motoresEmMovimento = true;
     return;
   }
@@ -350,7 +367,7 @@ void gerir_modo_automatico() {
   if (obstaculoMeio && !obstaculoEsquerda && obstaculoDireita) {
     drive_motor(mLeft, AUTO_CURVA_SUAVE_RAPIDO);
     drive_motor(mRight, AUTO_CURVA_SUAVE_LENTO);
-    drive_drum(AUTO_TAMBOR);
+    drive_drum(0);
     motoresEmMovimento = true;
     return;
   }
@@ -358,7 +375,7 @@ void gerir_modo_automatico() {
   if (!obstaculoMeio && obstaculoEsquerda && !obstaculoDireita) {
     drive_motor(mLeft, AUTO_CURVA_FORTE_LENTO);
     drive_motor(mRight, AUTO_CURVA_FORTE_RAPIDO);
-    drive_drum(AUTO_TAMBOR);
+    drive_drum(0);
     motoresEmMovimento = true;
     return;
   }
@@ -366,7 +383,7 @@ void gerir_modo_automatico() {
   if (!obstaculoMeio && !obstaculoEsquerda && obstaculoDireita) {
     drive_motor(mLeft, AUTO_CURVA_FORTE_RAPIDO);
     drive_motor(mRight, AUTO_CURVA_FORTE_LENTO);
-    drive_drum(AUTO_TAMBOR);
+    drive_drum(0);
     motoresEmMovimento = true;
     return;
   }
@@ -374,12 +391,48 @@ void gerir_modo_automatico() {
   if (obstaculoEsquerda && obstaculoMeio && obstaculoDireita) {
     drive_motor(mLeft, AUTO_RETO);
     drive_motor(mRight, AUTO_RETO);
-    drive_drum(AUTO_TAMBOR);
+    drive_drum(0);
     motoresEmMovimento = true;
     return;
   }
 
   stop_all_motors();
+}
+
+// =======================
+// SENSOR DE OBSTACULO VL53L0X
+// =======================
+void setup_sensor_obstaculo() {
+  Wire.begin(VL53_SDA, VL53_SCL);
+  Wire.setClock(100000);
+
+  sensorObstaculo.setTimeout(100);
+
+  if (sensorObstaculo.init()) {
+    sensorObstaculoOK = true;
+    sensorObstaculo.startContinuous();
+    Serial.println("{\"type\":\"INFO\",\"msg\":\"VL53L0X_OK\"}");
+  } else {
+    sensorObstaculoOK = false;
+    Serial.println("{\"type\":\"ERR\",\"msg\":\"VL53L0X_FAIL\"}");
+  }
+}
+
+bool obstaculo_frontal_detetado() {
+  if (!sensorObstaculoOK) {
+    obstaculoFrontal = false;
+    return false;
+  }
+
+  distanciaObstaculoMM = sensorObstaculo.readRangeContinuousMillimeters();
+
+  if (sensorObstaculo.timeoutOccurred()) {
+    obstaculoFrontal = false;
+    return false;
+  }
+
+  obstaculoFrontal = (distanciaObstaculoMM > 30 && distanciaObstaculoMM <= DISTANCIA_OBSTACULO_MM);
+  return obstaculoFrontal;
 }
 
 // =======================
@@ -417,11 +470,12 @@ void enviarTelemetriaSensores() {
   doc["left"] = obstaculoEsquerda;
   doc["center"] = obstaculoMeio;
   doc["right"] = obstaculoDireita;
+  doc["obstacle"] = obstaculoFrontal;
+  doc["distance_mm"] = distanciaObstaculoMM;
 
   serializeJson(doc, Serial);
   Serial.println();
 }
-
 
 void clique_pirilampo() {
   digitalWrite(PIN_PIRILAMPO, HIGH);
