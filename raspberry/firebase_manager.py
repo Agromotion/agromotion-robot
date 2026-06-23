@@ -358,7 +358,13 @@ class FirebaseManager:
             data["timestamp"] = firestore.SERVER_TIMESTAMP
 
             self.doc_ref.set(
-                {"telemetry": data},
+                {
+                    "telemetry": data,
+                    "status": {
+                        "online": True,
+                        "last_seen": firestore.SERVER_TIMESTAMP,
+                    }
+                },
                 merge=True,
             )
 

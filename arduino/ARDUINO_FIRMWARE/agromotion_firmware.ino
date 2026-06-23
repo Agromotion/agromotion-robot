@@ -452,11 +452,40 @@ void enviarTelemetriaGPS() {
   Serial.println();
 }
 
+float calcularPercentagemBateria(float v, bool emCarga) {
+  // Compensação simples: com motores ativos a tensão cai
+  if (emCarga) {
+    v += 0.25;
+  }
+
+  if (v >= 12.75) return 100;
+  if (v >= 12.60) return 90;
+  if (v >= 12.40) return 70;
+  if (v >= 12.20) return 40;
+  if (v >= 12.00) return 20;
+  if (v >= 11.80) return 10;
+  return 0;
+}
+
 void enviarTelemetriaBateria() {
+  int adc = analogRead(PIN_BATERIA);
+
+  float tensaoPino = (adc / ADC_MAX) * ADC_REF;
+  float tensaoBateria = tensaoPino * DIVISOR * CALIBRACAO;
+
+  if (tensaoFiltrada <= 0) {
+    tensaoFiltrada = tensaoBateria;
+  } else {
+    tensaoFiltrada = (tensaoFiltrada * 0.85) + (tensaoBateria * 0.15);
+  }
+
+  float percentagem = calcularPercentagemBateria(tensaoFiltrada, motoresEmMovimento);
+  percentagemAtual = percentagem;
+
   StaticJsonDocument<200> doc;
   doc["type"] = "BATTERY";
-  doc["voltage"] = 12.5;
-  doc["percentage"] = 80;
+  doc["voltage"] = tensaoFiltrada;
+  doc["percentage"] = (int)percentagemAtual;
   doc["is_moving"] = motoresEmMovimento;
   doc["auto_mode"] = autoModeEnabled;
 
